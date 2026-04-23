@@ -17,7 +17,7 @@ We always do **red/green**: the test is written first, it fails first, and then 
 
 1. `docs/intent/<feature-slug>.md`
 2. The feature's documentation (user-facing sections and personas)
-3. Any architecture notes
+3. `docs/architecture/<feature-slug>.md` — in particular the `## Workstreams` section. E2E tests span workstreams and belong to a single "integration" workstream with its own owner named there.
 4. The testing frameworks and conventions already in the repo
 
 ## What you produce

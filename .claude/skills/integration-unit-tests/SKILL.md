@@ -39,13 +39,18 @@ Test files at `tests/integration/<area>/<file>.<ext>` and `tests/unit/<area>/<fi
 
 ## How to run this step
 
-1. **Walk the feature top-down.** For each public unit described in docs, identify its direct collaborators. That gives you the integration surface.
-2. **For each unit, list what it does** as one-line claims. Each claim becomes one test.
-3. **For each claim, list the edge cases.** Empties, nulls, extremes, repeated calls, unusual orderings, concurrent calls where concurrency is a thing. Each edge case becomes one test.
-4. **Write the test file.** Docstring-per-test stating behavior. Arrange/act/assert clearly separated. Use the repo's existing fakes and helpers where they exist — never invent a parallel fake framework.
-5. **Add a fuzz/property test per function with structured input.** Even a trivial fuzz harness catches things exhaustive cases miss.
-6. **Run the full suite.** All should be red for the right reason (unit doesn't exist yet, or is incomplete). None should be red for the wrong reason (import error, broken fake, bad assertion).
-7. **Show the user a summary of the test matrix** — units × cases — and confirm coverage is complete before handing off.
+1. **Read the `## Workstreams` section of `docs/architecture/<slug>.md`.** Every workstream owns a `Tests` entry naming its test files. You'll write those files, grouped by workstream.
+2. **Walk the feature top-down per workstream.** For each public unit in the workstream's `Owns` list (as described in docs), identify its direct collaborators. That gives you the integration surface for this workstream.
+3. **For each unit, list what it does** as one-line claims. Each claim becomes one test.
+4. **For each claim, list the edge cases.** Empties, nulls, extremes, repeated calls, unusual orderings, concurrent calls where concurrency is a thing. Each edge case becomes one test.
+5. **Write the test file.** Docstring-per-test stating behavior. Arrange/act/assert clearly separated. Use the fakes named in the workstream's `Fakes needed` entry — if a fake doesn't exist yet, add it to a shared fakes file specified in the workstream plan.
+6. **Add a fuzz/property test per function with structured input.** Even a trivial fuzz harness catches things exhaustive cases miss.
+7. **Run the full suite.** All should be red for the right reason (unit doesn't exist yet, or is incomplete). None should be red for the wrong reason (import error, broken fake, bad assertion).
+8. **Show the user a summary of the test matrix** — workstreams × units × cases — and confirm coverage is complete before handing off.
+
+## Parallelization
+
+Because each workstream owns its own test files and depends only on the locked contract files, workstream test suites can be written concurrently. If multiple agents are available, dispatch one per workstream (each edits only that workstream's `Tests` paths). If working sequentially, order within a wave doesn't matter.
 
 ## Rules
 

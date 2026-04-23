@@ -16,20 +16,29 @@ description: End-to-end disciplined software development workflow that runs inte
    2. document                → README / docs (updates or creates)
            │
            ▼
-   3. plan-implementation     → (thinking; optional docs/architecture/<slug>.md draft)
+   3. plan-implementation     → docs/architecture/<slug>.md
+                                 (architectural decisions + workstream breakdown
+                                  for parallel work with minimal merge conflicts)
            │
            ▼
-   4. e2e-tests               → tests/e2e/<journey>.<ext>   (all red)
+   4. e2e-tests               → tests/e2e/<journey>.<ext>   (all red, one owner)
            │
            ▼
-   5. integration-unit-tests  → tests/integration/**  +  tests/unit/**   (all red)
+   5. integration-unit-tests  → tests/integration/**  +  tests/unit/**   (all red,
+                                 tests grouped by workstream so they can be
+                                 written in parallel)
            │
            ▼
-   6. implement               → production code  +  docs/architecture/<slug>.md
+   6. implement               → production code   (dispatched by workstream;
+                                 parallel where waves permit, sequential within
+                                 each wave;  docs/architecture/<slug>.md updated
+                                 as decisions land)
            │
            ▼
    7. review-stack            → pass / needs-rework report
 ```
+
+**Parallelization is a first-class output of step 3.** The workstream breakdown produced there is the scheduling input for steps 4, 5, and 6. Any step past 3 that cannot map its work cleanly onto the workstream list is a signal that step 3 was under-specified — escalate and refine it.
 
 ## Precedence hierarchy (reminder, enforced throughout)
 

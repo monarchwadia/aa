@@ -1,6 +1,6 @@
 ---
 name: plan-implementation
-description: Think through how to build the feature after documentation is written but before any tests or code. Produces no code and writes no files by default — this is a structured thinking step. Use after the `document` skill completes, or whenever the user says "let's think about how to build this", "plan the implementation", "what's the approach", "think before you code", "design the implementation". This is step 3 of the code-write workflow; its output is alignment with the user on the shape of the solution, not artifacts.
+description: Think through how to build the feature after documentation is written but before any tests or code. Produces no code; produces a required parallelization plan (workstreams designed to minimize merge conflicts) appended to docs/architecture/<slug>.md, plus optional architectural decision records. Use after the `document` skill completes, or whenever the user says "let's think about how to build this", "plan the implementation", "what's the approach", "think before you code", "design the implementation", "plan the workstreams", "how should we parallelize this". This is step 3 of the code-write workflow; its output is alignment with the user on the shape of the solution AND a workstream breakdown the later steps schedule against.
 ---
 
 # Plan Implementation
@@ -38,11 +38,55 @@ Work through each of these, briefly, and surface your reasoning to the user:
 7. **Testing surface.** What's easy to test, what's hard, what will need fakes or mocks? If something is hard to test, is it a design smell?
 8. **Naming.** Do the key concepts have verbose, unambiguous names that would survive being read by an LLM cold?
 9. **Non-goals revisited.** Re-read the intent's non-goals. Are you about to quietly implement one of them? Stop.
+10. **Parallelization of the work itself.** See next section — this is the final output of plan-implementation, and becomes the scheduling input for every step after.
+
+## Parallelization plan (required output)
+
+Before handing off to `e2e-tests`, you must produce a **workstream breakdown** designed to keep merge conflicts at or near zero while the later steps are worked — ideally by multiple agents in parallel.
+
+### What a workstream is
+
+A workstream is a unit of work that:
+- Owns a specific, named set of files. Nobody else writes to those files.
+- Depends on other workstreams **only through interfaces/contracts** that are agreed upfront — not through shared implementation files.
+- Can have its tests written and code drafted independently once its interface is pinned.
+
+### How to design them
+
+1. **Identify the seams.** The interfaces you listed in bullet 1 above are the natural cut lines. Each seam becomes a "contract file" — where the types/signatures are pinned early and everyone else codes against that file.
+2. **Group code into workstreams along those seams.** Each workstream owns one file or a small set of files that together implement one responsibility (e.g., "rules engine", "local backend", "ephemeral key provider").
+3. **Identify single-writer files.** Some files are inherently shared — e.g., the top-level CLI entry point where every subsystem gets wired in, or a central types file. Pick a single owner for each and schedule them late (after their collaborators' interfaces are stable).
+4. **Sort workstreams into waves.** A wave is a set of workstreams that can all run in parallel because none of them depends on another in the same wave. Wave N+1 starts only when wave N's interfaces are frozen (the files exist with the agreed types/signatures, even if bodies are stubs).
+5. **Pin fakes.** For any interface a workstream depends on, specify the fake/stub it should develop against so it isn't blocked on the real implementation.
+
+### What you record
+
+Append a `## Workstreams` section to `docs/architecture/<slug>.md` (creating it if needed) containing, in this order:
+
+1. **Contract files** — the short list of files where shared types/interfaces live. These are written *first*, by a single author (usually you), and locked before any workstream starts.
+2. **Workstreams, grouped by wave.** For each workstream, a one-line block:
+   - **Name** (short, imperative, e.g. `rules-engine`, `local-backend`, `proxy-binary`).
+   - **Owns:** exact file paths.
+   - **Consumes:** the contract files or interfaces it depends on.
+   - **Produces:** the interfaces/types/exported functions it exposes.
+   - **Fakes needed:** fakes for any collaborator interface it consumes.
+   - **Tests:** which test files it owns (unit + integration; e2e covered separately).
+3. **Shared / single-writer files.** Files that multiple workstreams *would* edit naïvely — enumerate them with the single owner and the wave they're scheduled in.
+4. **Known unavoidable conflict points.** If there is any file that must be co-edited, name it and specify the merge strategy (append-only, sectioned by comment, etc.).
+
+### Rules
+
+- **Interfaces before bodies.** The contract files must exist and be locked before any workstream is assigned.
+- **One workstream = one file (or a tight group).** If a workstream wants to touch files outside its `Owns` list, it raises and the breakdown is revised.
+- **Tests follow the workstream.** Unit and integration tests for a workstream's files live in the workstream. Cross-workstream tests are e2e, and belong to a single "integration" workstream with its own owner.
+- **Keep waves honest.** If wave 2 turns out to depend on a file wave 1 didn't produce, go back — the interface was under-specified.
+- **Small waves beat big ones.** Three workstreams of four files each is far better than one workstream of twelve files, even if the total work is the same.
 
 ## What you output
 
 - **A short summary to the user**, in conversation: 5–15 bullets covering the above, tailored to the feature. Not a template dump — actual thinking on this specific thing.
-- **If and only if an architectural decision is being made now** (something that shapes future code and needs to be durable): a draft entry in `docs/architecture/<feature-slug>.md` that the `implement` step will extend. Typical format:
+- **A parallelization plan** appended to `docs/architecture/<feature-slug>.md` under a `## Workstreams` section, per the format above. This is required — `e2e-tests`, `integration-unit-tests`, and `implement` all schedule against it.
+- **If architectural decisions are being made now** (things that shape future code and need to be durable): draft entries in `docs/architecture/<feature-slug>.md` that the `implement` step will extend. Typical format:
 
 ```markdown
 # <Feature> — Architecture Notes

@@ -23,17 +23,33 @@ Write the production code. Drive every change from a red test going green. Keep 
 
 ## How to run this step
 
-1. **Start at the lowest layer that has a red test.** Usually: pick an individual unit test, make it pass, move to the next. Work bottom-up through unit → integration → e2e.
-2. **Write the minimum code needed to turn each red test green.** Resist the urge to generalize. YAGNI.
-3. **After green, refactor.** Rename for clarity, extract when duplication is real (three hits, not two), unify only what's actually the same thing. Tests stay green throughout.
-4. **Watch for drift continuously.** At every step, compare what you're writing to docs and intent. If you notice drift, stop. Decide:
+1. **Read the `## Workstreams` section of `docs/architecture/<slug>.md`.** This is your schedule.
+2. **Write the contract files first, in a single pass.** These are the types/interfaces/signatures every workstream depends on. Nothing else begins until they exist and compile.
+3. **Execute workstreams wave by wave.**
+   - Within a wave, workstreams are independent by construction — dispatch them in parallel. If multiple agents are available (via the Agent tool), spawn one per workstream and let them run concurrently; each agent edits only its own `Owns` files.
+   - If only a single agent is available, run waves' workstreams sequentially but in any order within the wave — order doesn't affect correctness because ownership doesn't overlap.
+   - Wave N+1 starts only when wave N's workstreams are all green.
+4. **Single-writer / shared files are done by their named owner** at the scheduled wave, never opportunistically.
+5. **Within each workstream:**
+   - Start at its lowest layer with a red test. Usually: pick a unit test, make it pass, move to the next.
+   - Write the minimum code needed to turn each red test green. Resist the urge to generalize. YAGNI.
+   - After green, refactor: rename for clarity, extract when duplication is real (three hits, not two), unify only what's actually the same thing. Tests stay green throughout.
+6. **Watch for drift continuously.** At every change, compare what you're writing to docs and intent. If you notice drift, stop. Decide:
    - If intent was wrong → back to `intent`.
    - If docs were wrong → back to `document`.
+   - If the workstream breakdown was wrong → back to `plan-implementation` to revise the `## Workstreams` section.
    - If a test was wrong → amend with user approval.
    - If your code is wrong → fix the code.
-5. **Record architectural decisions** as you make them, in `docs/architecture/<feature-slug>.md`. Any choice future-you would want to know the *why* of — library choice, boundary placement, error-handling strategy, concurrency model.
-6. **Run the full suite frequently.** Every meaningful change.
-7. **When all tests are green and no drift remains, hand off to `review-stack`.**
+7. **Record architectural decisions as you make them**, in `docs/architecture/<feature-slug>.md`. Any choice future-you would want to know the *why* of — library choice, boundary placement, error-handling strategy, concurrency model.
+8. **Run the full suite frequently.** After each workstream lands. After each wave closes. Before every handoff.
+9. **When all tests are green and no drift remains, hand off to `review-stack`.**
+
+## Conflict-minimization rules (enforced by the workstream plan)
+
+- **Touch only what you own.** Each workstream has an `Owns` list in `docs/architecture/<slug>.md`. Editing files outside that list is a rule violation; raise it rather than doing it.
+- **If you need something from another workstream**, check whether its interface is already locked in a contract file. If yes, code against it (use the specified fake while its implementation lands). If no, stop — the workstream plan is under-specified; escalate.
+- **No cross-workstream refactors.** A refactor that touches multiple workstreams' files waits until all workstreams in the affected waves are green, then happens as its own dedicated workstream.
+- **Shared files merge with intent.** If the plan names a shared file (e.g. `main.go`) with a single owner and a wave number, only that owner edits it at that wave. Nobody sneaks changes in early.
 
 ## Code quality rules
 
