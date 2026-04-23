@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestUncommittedChangesWarningBlocksUntilAccepted
@@ -107,10 +108,11 @@ func TestUncommittedChangesWarningBlocksUntilAccepted(t *testing.T) {
 	// The accept path starts a real (but no-isolation, process-backend) session
 	// — no Docker needed because we're on the `process` backend.
 	clean := runAa(t, aaInvocation{
-		Args:    []string{},
-		HomeDir: home,
-		WorkDir: repo,
-		Stdin:   "y\n",
+		Args:     []string{},
+		HomeDir:  home,
+		WorkDir:  repo,
+		Stdin:    "y\n",
+		Deadline: 15 * time.Second,
 	})
 	assertNotContains(t, clean.Stdout+clean.Stderr, "Uncommitted changes", "no warning on clean tree")
 

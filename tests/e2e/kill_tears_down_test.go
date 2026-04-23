@@ -76,6 +76,7 @@ func TestKillTearsDownEverything(t *testing.T) {
 		HomeDir:  home,
 		WorkDir:  repo,
 		Deadline: 30 * time.Second,
+		ExtraEnv: map[string]string{"ANTHROPIC_ADMIN_KEY": "test-admin-key"},
 	})
 
 	// Confirm a key was minted.
@@ -92,11 +93,13 @@ func TestKillTearsDownEverything(t *testing.T) {
 	})
 	assertContains(t, listBefore.Stdout, "RUNNING", "aa list before kill")
 
-	// Step 2 — kill.
+	// Step 2 — kill. The admin key must be present so Revoke goes through
+	// the real provider (against the fake server) rather than the noop.
 	kill := runAa(t, aaInvocation{
-		Args:    []string{"kill"},
-		HomeDir: home,
-		WorkDir: repo,
+		Args:     []string{"kill"},
+		HomeDir:  home,
+		WorkDir:  repo,
+		ExtraEnv: map[string]string{"ANTHROPIC_ADMIN_KEY": "test-admin-key"},
 	})
 	assertExitCode(t, kill.ExitCode, 0, "aa kill")
 	// Kill output must mention each teardown step explicitly; users rely on
