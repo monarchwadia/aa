@@ -12,15 +12,15 @@
 //
 // Two guardrails make the danger explicit at runtime:
 //
-//   1. RunContainer refuses to launch unless the environment variable
-//      AA_ALLOW_UNSAFE_PROCESS_BACKEND=1 is set in the aa process's env.
-//      Config alone is not sufficient.
+//  1. RunContainer refuses to launch unless the environment variable
+//     AA_ALLOW_UNSAFE_PROCESS_BACKEND=1 is set in the aa process's env.
+//     Config alone is not sufficient.
 //
-//   2. InstallEgress refuses any allowlist more specific than "nothing to
-//      enforce" (empty slice or the universal ["*"] escape hatch). Any other
-//      value is a hard error, because this backend cannot enforce egress
-//      without interfering with the user's own networking, and a silent
-//      no-op would create the false impression that an allowlist is in force.
+//  2. InstallEgress refuses any allowlist more specific than "nothing to
+//     enforce" (empty slice or the universal ["*"] escape hatch). Any other
+//     value is a hard error, because this backend cannot enforce egress
+//     without interfering with the user's own networking, and a silent
+//     no-op would create the false impression that an allowlist is in force.
 //
 // The file that owns this backend is one of the deliverables of the
 // `backend-process` workstream in docs/architecture/aa.md § "Workstreams".
@@ -28,8 +28,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
 )
 
 // ProcessBackend implements Backend by running the agent as a detached child
@@ -56,6 +62,17 @@ type ProcessBackend struct {
 	// inspect the Cmd before it's actually started (or to substitute a
 	// harmless no-op binary).
 	StartAgentCommand func(name string, args ...string) *exec.Cmd
+
+	// pidsMu guards pidsByWorkspace. Teardown and RunContainer can run from
+	// different goroutines in tests and in production (aa kill arrives while
+	// the agent is still running), so a mutex is load-bearing here.
+	pidsMu sync.Mutex
+
+	// pidsByWorkspace maps host.Workspace → PID of the started agent
+	// process. Keyed by workspace rather than SessionID because Teardown's
+	// signature receives a Host, not a SessionID, and Workspace is the
+	// stable per-session identifier on this backend.
+	pidsByWorkspace map[string]int
 }
 
 // NewProcessBackend constructs a ProcessBackend rooted at the given absolute
@@ -66,7 +83,10 @@ type ProcessBackend struct {
 //
 //	backend := NewProcessBackend("/home/monarch/.aa/workspaces")
 func NewProcessBackend(workspacesRootDir string) *ProcessBackend {
-	return &ProcessBackend{WorkspacesRootDir: workspacesRootDir}
+	return &ProcessBackend{
+		WorkspacesRootDir: workspacesRootDir,
+		pidsByWorkspace:   map[string]int{},
+	}
 }
 
 // Provision creates a per-session workspace directory at
@@ -76,7 +96,15 @@ func NewProcessBackend(workspacesRootDir string) *ProcessBackend {
 //
 // Provision is part of the `backend-process` workstream.
 func (b *ProcessBackend) Provision(ctx context.Context, id SessionID) (Host, error) {
-	panic("backend-process workstream: ProcessBackend.Provision not implemented")
+	workspace := filepath.Join(b.WorkspacesRootDir, string(id))
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		return Host{}, fmt.Errorf("process backend: create workspace %q: %w", workspace, err)
+	}
+	return Host{
+		BackendType: "process",
+		Address:     "",
+		Workspace:   workspace,
+	}, nil
 }
 
 // InstallEgress is a guarded no-op. The process backend cannot enforce egress
@@ -87,7 +115,18 @@ func (b *ProcessBackend) Provision(ctx context.Context, id SessionID) (Host, err
 //
 // InstallEgress is part of the `backend-process` workstream.
 func (b *ProcessBackend) InstallEgress(ctx context.Context, host Host, allowlist []string) error {
-	panic("backend-process workstream: ProcessBackend.InstallEgress not implemented")
+	if len(allowlist) == 0 {
+		return nil
+	}
+	if len(allowlist) == 1 && allowlist[0] == "*" {
+		return nil
+	}
+	return fmt.Errorf(
+		"process backend cannot enforce egress: allowlist %v is not empty or [\"*\"]; "+
+			"set egress_enforcement=\"none\" in backend config (process backend forces it) "+
+			"or switch to the `local` or `fly` backend for real enforcement",
+		allowlist,
+	)
 }
 
 // RunContainer launches the agent's run command as a detached child process.
@@ -105,7 +144,62 @@ func (b *ProcessBackend) InstallEgress(ctx context.Context, host Host, allowlist
 //
 // RunContainer is part of the `backend-process` workstream.
 func (b *ProcessBackend) RunContainer(ctx context.Context, host Host, spec ContainerSpec) (ContainerHandle, error) {
-	panic("backend-process workstream: ProcessBackend.RunContainer not implemented")
+	if os.Getenv("AA_ALLOW_UNSAFE_PROCESS_BACKEND") != "1" {
+		return ContainerHandle{}, fmt.Errorf(
+			"process backend refused: AA_ALLOW_UNSAFE_PROCESS_BACKEND=1 is required " +
+				"because this backend runs the agent with full laptop access " +
+				"(no container, no VM, no egress firewall); set the env var only " +
+				"if you understand the risk — dev/test use only",
+		)
+	}
+
+	start := b.StartAgentCommand
+	if start == nil {
+		start = exec.Command
+	}
+	cmd := start("bash", "-lc", spec.AgentRun)
+	cmd.Dir = host.Workspace
+
+	env := make([]string, 0, len(spec.Env)+2)
+	for k, v := range spec.Env {
+		env = append(env, k+"="+v)
+	}
+	env = append(env, "AA_WORKSPACE="+host.Workspace)
+	env = append(env, "AA_SESSION_ID="+string(spec.SessionID))
+	cmd.Env = env
+
+	// Detach: new session + new process group so the agent outlives the
+	// aa process and does not receive its SIGHUP. INTENT success criterion
+	// "detach, close the laptop, reopen hours later, and reattach" depends
+	// on this.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// Setsid alone creates a new session AND a new process group — the
+	// child becomes session leader and process-group leader. Combining
+	// Setsid with Setpgid is rejected by setpgid(2) on Linux (EPERM), so
+	// we set only Setsid.
+	cmd.SysProcAttr.Setsid = true
+
+	if err := cmd.Start(); err != nil {
+		return ContainerHandle{}, fmt.Errorf("process backend: start agent: %w", err)
+	}
+
+	pid := 0
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	b.pidsMu.Lock()
+	if b.pidsByWorkspace == nil {
+		b.pidsByWorkspace = map[string]int{}
+	}
+	b.pidsByWorkspace[host.Workspace] = pid
+	b.pidsMu.Unlock()
+
+	return ContainerHandle{
+		ID:   fmt.Sprintf("%d", pid),
+		Host: host,
+	}, nil
 }
 
 // ReadRemoteFile reads a file from the session's workspace directly using
@@ -114,7 +208,12 @@ func (b *ProcessBackend) RunContainer(ctx context.Context, host Host, spec Conta
 //
 // ReadRemoteFile is part of the `backend-process` workstream.
 func (b *ProcessBackend) ReadRemoteFile(ctx context.Context, host Host, relpath string) ([]byte, error) {
-	panic("backend-process workstream: ProcessBackend.ReadRemoteFile not implemented")
+	full := filepath.Join(host.Workspace, relpath)
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return nil, fmt.Errorf("process backend: read %q: %w", full, err)
+	}
+	return data, nil
 }
 
 // StreamLogs tails a file under host.Workspace by polling its size and
@@ -122,7 +221,46 @@ func (b *ProcessBackend) ReadRemoteFile(ctx context.Context, host Host, relpath 
 //
 // StreamLogs is part of the `backend-process` workstream.
 func (b *ProcessBackend) StreamLogs(ctx context.Context, host Host, relpath string, w io.Writer) error {
-	panic("backend-process workstream: ProcessBackend.StreamLogs not implemented")
+	full := filepath.Join(host.Workspace, relpath)
+	f, err := os.Open(full)
+	if err != nil {
+		return fmt.Errorf("process backend: open log %q: %w", full, err)
+	}
+	defer f.Close()
+
+	// Goroutine-free tail: a 100ms ticker polls for new bytes. Exit path is
+	// ctx.Done — documented here as required by docs/PHILOSOPHY.md
+	// "every `go func()` says how it terminates". There is no goroutine
+	// here, but the exit contract is the same.
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	buf := make([]byte, 32*1024)
+	for {
+		// Drain whatever is currently readable before checking ctx, so a
+		// fast writer + fast cancel still gets everything written before
+		// the cancel.
+		for {
+			n, readErr := f.Read(buf)
+			if n > 0 {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return fmt.Errorf("process backend: write log chunk: %w", werr)
+				}
+			}
+			if readErr == io.EOF || n == 0 {
+				break
+			}
+			if readErr != nil {
+				return fmt.Errorf("process backend: read log %q: %w", full, readErr)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 // Teardown kills the agent's process group (if it is still running) and
@@ -133,5 +271,23 @@ func (b *ProcessBackend) StreamLogs(ctx context.Context, host Host, relpath stri
 //
 // Teardown is part of the `backend-process` workstream.
 func (b *ProcessBackend) Teardown(ctx context.Context, host Host) error {
-	panic("backend-process workstream: ProcessBackend.Teardown not implemented")
+	b.pidsMu.Lock()
+	pid, hadPid := b.pidsByWorkspace[host.Workspace]
+	if hadPid {
+		delete(b.pidsByWorkspace, host.Workspace)
+	}
+	b.pidsMu.Unlock()
+
+	if hadPid && pid > 0 {
+		// Signal the whole process group. Low ceremony: SIGKILL is the
+		// one-shot option that doesn't require a follow-up timer. If the
+		// group is already gone, Kill returns ESRCH, which is fine — we
+		// are idempotent.
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+
+	if err := os.RemoveAll(host.Workspace); err != nil {
+		return fmt.Errorf("process backend: remove workspace %q: %w", host.Workspace, err)
+	}
+	return nil
 }

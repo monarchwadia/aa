@@ -11,17 +11,16 @@
 // passed as a distinct exec.Cmd arg; nothing is interpolated into a shell
 // invocation on the laptop side. The remote shell is the user's concern on
 // the remote side (ssh inherently delegates there).
-//
-// Implementation is intentionally a stub at this point — see workstream
-// `ssh-runner` in docs/architecture/aa.md § "Workstreams". Tests in
-// ssh_runner_test.go pin the contract; a later implement-pass turns them
-// green.
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os/exec"
+	"path/filepath"
 )
 
 // RealSSHRunnerExecCommand is the indirection point the production code uses
@@ -83,6 +82,29 @@ func NewRealSSHRunner(controlDir string) *RealSSHRunner {
 	return &RealSSHRunner{ControlDir: controlDir}
 }
 
+// controlPathFor returns the ControlPath socket path for a given host
+// address. The filename is a hex-encoded SHA-256 of the address with a
+// fixed suffix, so repeated calls against the same address reuse one
+// connection while different addresses get different sockets. Hashing the
+// address keeps arbitrary metacharacters, spaces, and colons from leaking
+// into a filesystem path.
+func (r *RealSSHRunner) controlPathFor(address string) string {
+	sum := sha256.Sum256([]byte(address))
+	name := hex.EncodeToString(sum[:]) + ".sock"
+	return filepath.Join(r.ControlDir, name)
+}
+
+// sshControlFlags returns the ControlMaster/ControlPath/ControlPersist
+// `-o` flag sequence for the given host, suitable for splicing into a
+// composed argv ahead of ExtraSSHFlags and the host token.
+func (r *RealSSHRunner) sshControlFlags(address string) []string {
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + r.controlPathFor(address),
+		"-o", "ControlPersist=60s",
+	}
+}
+
 // Run executes a non-interactive command on host and returns the captured
 // stdout/stderr plus the remote process exit code. A non-zero exit code is
 // reported via SSHResult.ExitCode with a nil error; only failures to spawn
@@ -95,7 +117,35 @@ func NewRealSSHRunner(controlDir string) *RealSSHRunner {
 //	    "test -f /workspace/.aa/result.patch")
 //	// result.ExitCode == 0 or 1 depending on whether the file exists.
 func (r *RealSSHRunner) Run(ctx context.Context, host Host, cmd string) (SSHResult, error) {
-	panic("unimplemented — see workstream ssh-runner in docs/architecture/aa.md § Workstreams")
+	args := make([]string, 0, 6+len(r.ExtraSSHFlags)+2)
+	args = append(args, r.sshControlFlags(host.Address)...)
+	args = append(args, r.ExtraSSHFlags...)
+	args = append(args, host.Address)
+	args = append(args, cmd)
+
+	execCmd := RealSSHRunnerExecCommand(ctx, "ssh", args...)
+	var stdout, stderr bytes.Buffer
+	execCmd.Stdout = &stdout
+	execCmd.Stderr = &stderr
+
+	err := execCmd.Run()
+	result := SSHResult{
+		Stdout:   stdout.Bytes(),
+		Stderr:   stderr.Bytes(),
+		ExitCode: execCmd.ProcessState.ExitCode(),
+	}
+	if err != nil {
+		// A non-zero remote exit surfaces as *exec.ExitError; that is NOT
+		// an aa-level error — the caller consumes ExitCode. Anything else
+		// (binary missing, context cancelled, etc.) IS a spawn/lifecycle
+		// error and must be surfaced.
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			_ = exitErr
+			return result, nil
+		}
+		return result, err
+	}
+	return result, nil
 }
 
 // Attach runs an interactive command on host with a PTY, plumbing the
@@ -109,7 +159,18 @@ func (r *RealSSHRunner) Run(ctx context.Context, host Host, cmd string) (SSHResu
 //	    "tmux attach -t aa-session",
 //	    os.Stdin, os.Stdout, os.Stderr)
 func (r *RealSSHRunner) Attach(ctx context.Context, host Host, cmd string, stdin io.Reader, stdout, stderr io.Writer) error {
-	panic("unimplemented — see workstream ssh-runner in docs/architecture/aa.md § Workstreams")
+	args := make([]string, 0, 7+len(r.ExtraSSHFlags)+2)
+	args = append(args, "-t")
+	args = append(args, r.sshControlFlags(host.Address)...)
+	args = append(args, r.ExtraSSHFlags...)
+	args = append(args, host.Address)
+	args = append(args, cmd)
+
+	execCmd := RealSSHRunnerExecCommand(ctx, "ssh", args...)
+	execCmd.Stdin = stdin
+	execCmd.Stdout = stdout
+	execCmd.Stderr = stderr
+	return execCmd.Run()
 }
 
 // Copy transfers a single file between laptop and host using scp.
@@ -129,7 +190,13 @@ func (r *RealSSHRunner) Attach(ctx context.Context, host Host, cmd string, stdin
 //	    "root@10.0.0.5:/workspace/.aa/result.patch",
 //	    "/home/alice/repo/.aa/result.patch")
 func (r *RealSSHRunner) Copy(ctx context.Context, host Host, src, dst string) error {
-	panic("unimplemented — see workstream ssh-runner in docs/architecture/aa.md § Workstreams")
+	args := make([]string, 0, len(r.ExtraSCPFlags)+2)
+	args = append(args, r.ExtraSCPFlags...)
+	args = append(args, src)
+	args = append(args, dst)
+
+	execCmd := RealSSHRunnerExecCommand(ctx, "scp", args...)
+	return execCmd.Run()
 }
 
 // Compile-time proof that *RealSSHRunner satisfies the SSHRunner contract.
