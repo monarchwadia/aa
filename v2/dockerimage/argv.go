@@ -5,35 +5,25 @@
 // slice (never a shell string).
 package dockerimage
 
+import "aa/v2/imageref"
+
 // BuildArgv returns the argv for `docker build -t <tag> <contextPath>`.
-//
-// Example: BuildArgv(ImageRef{Host:"registry.fly.io", Repo:"aa-apps/myapi", Reference:"latest"}, "./myapi")
-// returns []string{"build", "-t", "registry.fly.io/aa-apps/myapi:latest", "./myapi"}.
-func BuildArgv(ref ImageRef, contextPath string) []string {
+func BuildArgv(ref imageref.ImageRef, contextPath string) []string {
 	return []string{"build", "-t", ref.String(), contextPath}
 }
 
 // PushArgv returns the argv for `docker push <tag>`.
-//
-// Example: PushArgv(ImageRef{Host:"registry.fly.io", Repo:"aa-apps/myapi", Reference:"latest"})
-// returns []string{"push", "registry.fly.io/aa-apps/myapi:latest"}.
-func PushArgv(ref ImageRef) []string {
+func PushArgv(ref imageref.ImageRef) []string {
 	return []string{"push", ref.String()}
 }
 
 // LoginArgv returns the argv for `docker login <host> -u x -p <token>`.
 // The token is placed in argv exactly once; no further docker call receives it.
-//
-// Example: LoginArgv("registry.fly.io", "fo1_abc") returns
-// []string{"login", "registry.fly.io", "-u", "x", "-p", "fo1_abc"}.
 func LoginArgv(host, token string) []string {
 	return []string{"login", host, "-u", "x", "-p", token}
 }
 
 // InspectArgv returns the argv for `docker image inspect <tag>`.
-//
-// Example: InspectArgv(ImageRef{Host:"registry.fly.io", Repo:"aa-apps/myapi", Reference:"latest"})
-// returns []string{"image", "inspect", "registry.fly.io/aa-apps/myapi:latest"}.
-func InspectArgv(ref ImageRef) []string {
+func InspectArgv(ref imageref.ImageRef) []string {
 	return []string{"image", "inspect", ref.String()}
 }

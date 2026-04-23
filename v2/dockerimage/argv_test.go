@@ -9,10 +9,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"aa/v2/imageref"
 )
 
-func tagRef() ImageRef {
-	return ImageRef{Host: "registry.fly.io", Repo: "aa-apps/myapi", Reference: "latest"}
+func tagRef() imageref.ImageRef {
+	return imageref.ImageRef{Host: "registry.fly.io", Repo: "aa-apps/myapi", Reference: "latest"}
 }
 
 // BuildArgv produces `build -t <fq-tag> <context>` (exact slice).
@@ -62,7 +64,7 @@ func TestInspectArgvExactSlice(t *testing.T) {
 // Tags with shell-metacharacters remain a single argv slot — the invariant
 // argv construction buys over shell-string composition.
 func TestBuildArgvTagWithShellMetaStaysOneSlot(t *testing.T) {
-	nastyRef := ImageRef{Host: "registry.fly.io", Repo: "aa-apps/a;b", Reference: "latest"}
+	nastyRef := imageref.ImageRef{Host: "registry.fly.io", Repo: "aa-apps/a;b", Reference: "latest"}
 	got := BuildArgv(nastyRef, "./ctx")
 	if got[2] != "registry.fly.io/aa-apps/a;b:latest" {
 		t.Fatalf("tag arg split or mangled: %v", got)

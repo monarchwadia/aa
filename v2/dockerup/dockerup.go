@@ -1,26 +1,16 @@
 // Package dockerup is the wave-3 `aa docker up` slug: a thin composition
 // over the sibling flyclient, registry, and extbin packages.
-//
-// This file is a stub. The real implementation is written in the
-// `implement` step of the code-write workflow. The symbols declared here
-// exist solely so the red unit and integration test suites can compile.
-// Every function panics with "not implemented" — that is the red signal
-// the test runner picks up.
-//
-// Shape of the eventual implementation is spelled out in
-// docs/architecture/docker-up.md. In particular:
-//   - Label: sha256(absolutePath(<path>))[:12], lower-cased path.
-//   - Run:   the four-stage orchestrator (build → push → spawn → attach)
-//     with the --force cascade (destroy old machine between push and spawn)
-//     and attach-failure cleanup (destroy the new machine).
-//
-// The seams this slug binds against live in the sibling packages:
-// flyclient.Client, registry.Registry, extbin.Runner. This package does
-// not define parallel interfaces — it consumes those directly.
 package dockerup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"aa/v2/extbin"
 	"aa/v2/flyclient"
@@ -32,42 +22,124 @@ import (
 // amendment (2026-04-23): "aa.up-id".
 const LabelKey = "aa.up-id"
 
-// Label returns the identity label value for the given on-disk path. Per
-// ADR-1 + the 2026-04-23 amendment, the value is the first 12 lowercase
-// hex characters of sha256 over the lower-cased absolute path of <path>.
-// Stable across invocations from the same directory; different for
-// different directories.
-//
-// Example:
-//
-//	Label("/home/alex/myapi") == "7e3f0b9a2c4d" // some stable 12-hex value
+// Label returns the identity label value for the given on-disk path:
+// the first 12 lowercase hex chars of sha256(strings.ToLower(absPath(path))).
 func Label(path string) (string, error) {
-	panic("dockerup.Label: not implemented (Wave 3)")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256([]byte(strings.ToLower(abs)))
+	return hex.EncodeToString(h[:])[:12], nil
 }
 
-// Options is the input to Run: everything the orchestrator needs to walk
-// the four-stage chain. Collaborators are injected so tests can
-// substitute fakes at the seams listed in docs/architecture/docker-up.md.
+// Options is the input to Run.
 type Options struct {
-	BuildContextPath string // absolute or relative directory containing a Dockerfile.
-	Force            bool   // true = replace an existing instance tied to this directory.
-	AppName          string // Fly app to spawn into (from ConfigReader.ResolveDefaultApp()).
-	RegistryBase     string // registry host (from ConfigReader.ResolveRegistryBase()).
+	BuildContextPath string
+	Force            bool
+	AppName          string
+	RegistryBase     string
 
-	Fly      flyclient.Client  // machine-lifecycle seam.
-	Registry registry.Registry // docker-images push seam.
-	ExtBin   extbin.Runner     // docker build + flyctl ssh console seam.
+	Fly      flyclient.Client
+	Registry registry.Registry
+	ExtBin   extbin.Runner
+
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
-// Run is the four-stage orchestrator. It walks build → push → spawn →
-// attach sequentially, honours --force (destroy old machine between push
-// success and spawn start), and, on attach failure, destroys the spawned
-// machine before returning the attach error.
-//
-// Returns nil on clean shell exit. Returns a non-nil error whose message
-// names exactly one failed stage (build, push, spawn, attach).
-//
-// Stub; Wave 3.
+// Run is the four-stage orchestrator: build → push → spawn → attach.
 func Run(ctx context.Context, opts Options) error {
-	panic("dockerup.Run: not implemented (Wave 3)")
+	if opts.Stdout == nil {
+		opts.Stdout = io.Discard
+	}
+	if opts.Stderr == nil {
+		opts.Stderr = io.Discard
+	}
+
+	dockerfilePath := filepath.Join(opts.BuildContextPath, "Dockerfile")
+	if _, err := os.Stat(dockerfilePath); err != nil {
+		return fmt.Errorf("no Dockerfile at %s — aa docker up requires a directory containing a Dockerfile", dockerfilePath)
+	}
+
+	label, err := Label(opts.BuildContextPath)
+	if err != nil {
+		return fmt.Errorf("label: %w", err)
+	}
+
+	matches, err := opts.Fly.FindByLabel(ctx, opts.AppName, LabelKey, label)
+	if err != nil {
+		return fmt.Errorf("find existing: %w", err)
+	}
+	if len(matches) > 0 && !opts.Force {
+		ids := make([]string, 0, len(matches))
+		for _, m := range matches {
+			ids = append(ids, m.ID)
+		}
+		joined := strings.Join(ids, ", ")
+		return fmt.Errorf(
+			"instance %s is already tied to %s — pass --force to replace it, or run 'aa machine rm %s' first",
+			joined, opts.BuildContextPath, ids[0],
+		)
+	}
+
+	regBase := opts.RegistryBase
+	if regBase == "" {
+		regBase = "registry.fly.io"
+	}
+	tag := fmt.Sprintf("%s/aa-apps/aa-up-%s:latest", regBase, label)
+
+	// Build
+	code, err := opts.ExtBin.Run(ctx, extbin.Invocation{
+		Name:   "docker",
+		Argv:   []string{"build", "-t", tag, opts.BuildContextPath},
+		Stdout: opts.Stdout,
+		Stderr: opts.Stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("build: docker exited %d", code)
+	}
+
+	// Push
+	if err := opts.Registry.Push(ctx, tag); err != nil {
+		return fmt.Errorf("push: %w", err)
+	}
+
+	// Destroy old (force)
+	if opts.Force {
+		for _, m := range matches {
+			if err := opts.Fly.Destroy(ctx, opts.AppName, m.ID, true); err != nil {
+				return fmt.Errorf("destroy old machine %s: %w", m.ID, err)
+			}
+		}
+	}
+
+	// Spawn
+	machine, err := opts.Fly.Create(ctx, opts.AppName, flyclient.SpawnSpec{
+		Image:  tag,
+		Labels: map[string]string{LabelKey: label},
+	})
+	if err != nil {
+		return fmt.Errorf("spawn: %w", err)
+	}
+
+	// Attach
+	code, err = opts.ExtBin.Run(ctx, extbin.Invocation{
+		Name:   "flyctl",
+		Argv:   []string{"ssh", "console", "--app", opts.AppName, "--machine", machine.ID},
+		Stdin:  os.Stdin,
+		Stdout: opts.Stdout,
+		Stderr: opts.Stderr,
+	})
+	if err != nil || code != 0 {
+		_ = opts.Fly.Destroy(ctx, opts.AppName, machine.ID, true)
+		if err != nil {
+			return fmt.Errorf("attach: %w", err)
+		}
+		return fmt.Errorf("attach: flyctl exited %d", code)
+	}
+	return nil
 }

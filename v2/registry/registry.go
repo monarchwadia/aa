@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"aa/v2/dockerimage"
+	"aa/v2/imageref"
 )
 
 // httpRegistry is the production Registry. It is safe to share across goroutines.
@@ -111,7 +111,7 @@ func (r *httpRegistry) List(ctx context.Context, prefix string) ([]Image, error)
 // registry DELETE. The two-step dance is required by the Docker Registry v2
 // protocol: you cannot delete by tag, only by digest.
 func (r *httpRegistry) Delete(ctx context.Context, tag string) error {
-	ref, err := dockerimage.ParseFullyQualified(tag)
+	ref, err := imageref.ParseFullyQualified(tag)
 	if err != nil {
 		return fmt.Errorf("delete %s: %w", tag, err)
 	}
@@ -137,7 +137,7 @@ func (r *httpRegistry) Delete(ctx context.Context, tag string) error {
 
 // resolveDigest looks up the content digest for an image reference. Registry
 // v2 returns it in the Docker-Content-Digest header on HEAD /manifests/<ref>.
-func (r *httpRegistry) resolveDigest(ctx context.Context, ref dockerimage.ImageRef) (string, error) {
+func (r *httpRegistry) resolveDigest(ctx context.Context, ref imageref.ImageRef) (string, error) {
 	// If the reference already looks like a digest, use it directly.
 	if strings.HasPrefix(ref.Reference, "sha256:") {
 		return ref.Reference, nil
