@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -265,6 +267,83 @@ func TestSessionManager_StartSession_OnSuccessWritesObservabilityLinesToOut(t *t
 	}
 }
 
+func TestSessionManager_StartSession_SyncsRepoIntoLocalWorkspaceWhenHostAddressEmpty(t *testing.T) {
+	f := newSMFixture(t, nil)
+
+	// Build a realistic laptop-local repo with a known marker file.
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.txt"), []byte("original"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("seed .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("seed .git/HEAD: %v", err)
+	}
+
+	// Empty workspace directory stands in for ~/.aa/workspaces/<id>/.
+	workspace := t.TempDir()
+
+	f.backend.ProvisionFn = func(ctx context.Context, id SessionID) (Host, error) {
+		return Host{Address: "", BackendType: "process", Workspace: workspace}, nil
+	}
+
+	if _, err := f.sm.StartSession(context.Background(), repoDir, "main", stubCfg()); err != nil {
+		t.Fatalf("StartSession: unexpected error: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(workspace, "hello.txt"))
+	if err != nil {
+		t.Fatalf("StartSession: expected hello.txt in workspace, got read error: %v", err)
+	}
+	if string(got) != "original" {
+		t.Fatalf("StartSession: hello.txt contents: want %q, got %q", "original", got)
+	}
+	// .git/ must also have been copied so the agent can produce patches.
+	if _, err := os.Stat(filepath.Join(workspace, ".git", "HEAD")); err != nil {
+		t.Fatalf("StartSession: expected .git/HEAD in workspace, got stat error: %v", err)
+	}
+
+	out := f.out.String()
+	if !strings.Contains(strings.ToLower(out), "sync") {
+		t.Fatalf("StartSession: Out missing sync progress line; got: %s", out)
+	}
+}
+
+func TestSessionManager_StartSession_SkipsSyncWhenHostAddressNonEmpty(t *testing.T) {
+	f := newSMFixture(t, nil)
+
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.txt"), []byte("original"), 0o644); err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+
+	// Non-empty workspace that would normally trigger the "not empty" guard
+	// if the sync ran — proving the skip.
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "preexisting.txt"), []byte("remote-managed"), 0o644); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+
+	f.backend.ProvisionFn = func(ctx context.Context, id SessionID) (Host, error) {
+		return Host{Address: "user@remote:22", BackendType: "fly", Workspace: workspace}, nil
+	}
+
+	if _, err := f.sm.StartSession(context.Background(), repoDir, "main", stubCfg()); err != nil {
+		t.Fatalf("StartSession: unexpected error: %v", err)
+	}
+
+	// hello.txt must NOT have been copied — remote backend handles its own sync.
+	if _, err := os.Stat(filepath.Join(workspace, "hello.txt")); !os.IsNotExist(err) {
+		t.Fatalf("StartSession: hello.txt must not be copied into remote-backend workspace, stat err=%v", err)
+	}
+	// The pre-existing file must still be there (proving no copy clobbered anything).
+	if _, err := os.Stat(filepath.Join(workspace, "preexisting.txt")); err != nil {
+		t.Fatalf("StartSession: preexisting.txt missing from workspace, err=%v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Attach
 // ---------------------------------------------------------------------------
@@ -305,6 +384,46 @@ func TestSessionManager_Attach_OnRunningDelegatesToSSHRunner(t *testing.T) {
 	}
 	if len(f.ssh.AttachCalls) != 1 {
 		t.Fatalf("SSH.Attach: want 1 call, got %d", len(f.ssh.AttachCalls))
+	}
+}
+
+func TestSessionManager_Attach_OnLocalHostTailsAgentLogInsteadOfSSH(t *testing.T) {
+	f := newSMFixture(t, nil)
+
+	// Real on-disk workspace with .aa/agent.log populated.
+	workspace := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workspace, ".aa"), 0o755); err != nil {
+		t.Fatalf("seed .aa: %v", err)
+	}
+	logBytes := []byte("agent line 1\nagent line 2\n")
+	if err := os.WriteFile(filepath.Join(workspace, ".aa", "agent.log"), logBytes, 0o644); err != nil {
+		t.Fatalf("seed agent.log: %v", err)
+	}
+
+	id := SessionID("repo-feature")
+	f.seedRecord(id, Host{Address: "", BackendType: "process", Workspace: workspace})
+
+	// RUNNING on entry (empty state file, container alive); transitions to
+	// DONE so the tail loop terminates after draining the existing bytes.
+	var reads int32
+	f.backend.ReadRemoteFileFn = func(ctx context.Context, host Host, relpath string) ([]byte, error) {
+		if atomic.AddInt32(&reads, 1) == 1 {
+			return []byte(""), nil
+		}
+		return []byte("DONE"), nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.sm.Attach(ctx, id); err != nil {
+		t.Fatalf("Attach: unexpected error: %v", err)
+	}
+
+	if len(f.ssh.AttachCalls) != 0 {
+		t.Fatalf("Attach: SSH.Attach must not be called for empty-Address host, got %d calls", len(f.ssh.AttachCalls))
+	}
+	if !strings.Contains(f.out.String(), "agent line 1") || !strings.Contains(f.out.String(), "agent line 2") {
+		t.Fatalf("Attach: Out must contain tailed agent.log bytes; got: %q", f.out.String())
 	}
 }
 

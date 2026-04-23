@@ -208,6 +208,26 @@ func (s *SessionManager) StartSession(ctx context.Context, repo, branch string, 
 	}
 	s.writeOut("minted ephemeral key %s for session %s", handle.ID, id)
 
+	// 2.5. Sync the repo working tree into the workspace. This is a no-op
+	// for backends whose host is remote (Address != "") or whose workspace
+	// is inside a container bind-mounted elsewhere; those backends handle
+	// their own sync. For local laptop-filesystem backends (e.g. process),
+	// the repo must be copied in before the agent runs or the agent sees
+	// an empty directory. Failure rolls back Mint + Provision just like any
+	// other StartSession step.
+	if host.Address == "" {
+		if err := s.syncRepoIntoWorkspace(repo, host.Workspace); err != nil {
+			s.writeErr("start: sync repo failed: %v", err)
+			if rErr := s.KeyProvider.Revoke(ctx, handle); rErr != nil {
+				s.writeErr("start: rollback revoke failed: %v", rErr)
+			}
+			if tdErr := s.Backend.Teardown(ctx, host); tdErr != nil {
+				s.writeErr("start: rollback teardown failed: %v", tdErr)
+			}
+			return "", fmt.Errorf("start session %s: sync repo: %w", id, err)
+		}
+	}
+
 	// 3. Install egress.
 	agentName := ""
 	var agent AgentConfig
@@ -275,8 +295,12 @@ func (s *SessionManager) StartSession(ctx context.Context, repo, branch string, 
 }
 
 // Attach checks the session's state and, if RUNNING, delegates to
-// SSH.Attach with a tmux-attach command. Non-RUNNING sessions return an
-// error telling the user to consult `aa status`.
+// SSH.Attach with a tmux-attach command — unless the host is local
+// (Address == ""), in which case SSH would resolve an empty hostname and
+// fail. For local hosts we instead tail $AA_WORKSPACE/.aa/agent.log
+// directly on the laptop until ctx is cancelled or the session reaches a
+// terminal state. Non-RUNNING sessions return an error telling the user
+// to consult `aa status`.
 //
 // Example:
 //
@@ -298,11 +322,6 @@ func (s *SessionManager) Attach(ctx context.Context, id SessionID) error {
 		return fmt.Errorf("attach session %s: no local record", id)
 	}
 
-	// tmux attach to the session's named tmux; aa wraps agent runs in a
-	// tmux session so detach/reattach works over SSH.
-	cmd := fmt.Sprintf("tmux attach -t %s", string(id))
-	s.writeOut("attaching to session %s", id)
-
 	var stdin io.Reader = os.Stdin
 	var stdout io.Writer = os.Stdout
 	var stderr io.Writer = os.Stderr
@@ -312,7 +331,104 @@ func (s *SessionManager) Attach(ctx context.Context, id SessionID) error {
 	if s.Err != nil {
 		stderr = s.Err
 	}
+
+	// Local backend: tail the agent log file directly. SSH against an
+	// empty address would fail with "could not resolve hostname :".
+	if rec.Host.Address == "" {
+		s.writeOut("attaching to session %s (local tail)", id)
+		return s.tailLocalAgentLog(ctx, id, rec.Host.Workspace, stdout)
+	}
+
+	// Remote backend: tmux-attach over SSH. aa wraps agent runs in a tmux
+	// session so detach/reattach works.
+	cmd := fmt.Sprintf("tmux attach -t %s", string(id))
+	s.writeOut("attaching to session %s", id)
 	return s.SSH.Attach(ctx, rec.Host, cmd, stdin, stdout, stderr)
+}
+
+// tailLocalAgentLog opens $workspace/.aa/agent.log and copies new bytes to
+// out until ctx is cancelled OR the session's state transitions to a
+// terminal value (DONE / FAILED / LIMBO / INCONSISTENT). If the log file
+// doesn't exist yet the function prints a "waiting" notice and polls at
+// 200ms until it appears. Polling cadence for both "file not yet created"
+// and "no new bytes since last read" is 200ms — short enough to feel
+// interactive, long enough to keep the loop cheap.
+//
+// Example:
+//
+//	// agent.log contains "starting…\n" and more will be appended
+//	err := sm.tailLocalAgentLog(ctx, "myapp-feature-oauth",
+//	    "/home/alice/.aa/workspaces/myapp-feature-oauth", os.Stdout)
+func (s *SessionManager) tailLocalAgentLog(ctx context.Context, id SessionID, workspace string, out io.Writer) error {
+	logPath := filepath.Join(workspace, ".aa", "agent.log")
+
+	// Poll until the agent's log file exists. The loop exits via an
+	// explicit return (ctx cancel / unexpected error) or via `break` once
+	// os.Open succeeds.
+	var f *os.File
+	announcedWaiting := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil
+		}
+		opened, err := os.Open(logPath)
+		if err == nil {
+			f = opened
+			break
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("attach session %s: open agent log %s: %w", id, logPath, err)
+		}
+		if !announcedWaiting {
+			fmt.Fprintln(out, "waiting for agent output...")
+			announcedWaiting = true
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	defer f.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil
+		}
+		n, err := f.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return fmt.Errorf("attach session %s: write agent log bytes: %w", id, werr)
+			}
+		}
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("attach session %s: read agent log: %w", id, err)
+		}
+		if n == 0 {
+			// No new bytes. Check whether the session is terminal; if so,
+			// drain is complete — exit cleanly.
+			state, _, stErr := s.Status(ctx, id)
+			if stErr == nil && isTerminalState(state) {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+}
+
+// isTerminalState reports whether the given SessionState is one of the
+// post-run states where no further agent output will appear.
+func isTerminalState(state SessionState) bool {
+	switch state {
+	case StateDone, StateFailed, StateLimbo, StateInconsistent, StateFailedProvision:
+		return true
+	}
+	return false
 }
 
 // Status reads the local record, reads the remote state file from the
@@ -738,6 +854,45 @@ func (s *SessionManager) Sweep(ctx context.Context) (SweepReport, error) {
 func isBackendOrphanLister(b Backend) bool {
 	_, ok := b.(BackendOrphanLister)
 	return ok
+}
+
+// syncRepoIntoWorkspace copies every file (including .git/) from repoPath
+// into workspacePath via `cp -a <repo>/. <workspace>/`. The trailing `/.`
+// form is portable between GNU cp and BSD cp (macOS) and copies the
+// directory's *contents* into the destination without creating a nested
+// subdirectory. `-a` preserves file modes and follows no symlinks out of
+// the repo (`-a` implies `--no-dereference` on GNU cp and is equivalent on
+// BSD cp).
+//
+// If workspacePath is missing the function errors; if it already contains
+// any entries the function errors (a prior session wasn't cleaned up and
+// silently overwriting would hide state). Emits one observability line to
+// Out on start and one on completion.
+//
+// Example:
+//
+//	// repo: /home/alice/src/myapp (contains .git/, src/, aa.json)
+//	// workspace: /home/alice/.aa/workspaces/myapp-feature-oauth
+//	err := sm.syncRepoIntoWorkspace("/home/alice/src/myapp",
+//	    "/home/alice/.aa/workspaces/myapp-feature-oauth")
+//	// workspace now contains .git/, src/, aa.json with original modes.
+func (s *SessionManager) syncRepoIntoWorkspace(repoPath, workspacePath string) error {
+	entries, err := os.ReadDir(workspacePath)
+	if err != nil {
+		return fmt.Errorf("read workspace %s: %w", workspacePath, err)
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("workspace %s is not empty (%d entries) — a prior session may not have been cleaned up", workspacePath, len(entries))
+	}
+
+	s.writeOut("syncing repo %s into workspace %s", repoPath, workspacePath)
+	cmd := exec.Command("cp", "-a", repoPath+"/.", workspacePath+"/")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("cp -a %s/. %s/: %w: %s", repoPath, workspacePath, err, bytes.TrimSpace(out))
+	}
+	s.writeOut("synced repo into workspace %s", workspacePath)
+	return nil
 }
 
 // Assertions that imported helpers are used even on compile paths that
