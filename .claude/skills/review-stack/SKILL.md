@@ -22,14 +22,15 @@ A feature passes this step only if all of the following are true:
 
 ## Inputs (read in this order)
 
-1. `docs/intent/<feature-slug>.md`
-2. Feature documentation
-3. `docs/architecture/<feature-slug>.md`
-4. E2E tests
-5. Integration tests
-6. Unit tests
-7. Production code
-8. The test run output (all runs, full output)
+1. **`docs/PHILOSOPHY.md`** — the arbiter when layers disagree on style. The anti-patterns list is a block-list; any occurrence in the code being reviewed is a violation to surface.
+2. `docs/intent/<feature-slug>.md`
+3. Feature documentation
+4. `docs/architecture/<feature-slug>.md`
+5. E2E tests
+6. Integration tests
+7. Unit tests
+8. Production code
+9. The test run output (all runs, full output)
 
 ## How to run this step
 

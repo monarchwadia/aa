@@ -1,0 +1,11 @@
+# Built binaries — cross-compiled by aa's build, never committed.
+/aa
+/cmd/aa/aa
+/cmd/aa-proxy/aa-proxy
+
+# Go test build cache / coverage
+*.test
+*.out
+
+# Session and config data aa writes at runtime (never in a repo).
+.aa/

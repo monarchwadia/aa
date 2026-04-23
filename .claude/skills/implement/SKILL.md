@@ -13,13 +13,14 @@ Write the production code. Drive every change from a red test going green. Keep 
 
 ## Inputs (read in this order)
 
-1. `docs/intent/<feature-slug>.md`
-2. Feature documentation
-3. `docs/architecture/<feature-slug>.md` (existing notes)
-4. E2E tests
-5. Integration tests
-6. Unit tests
-7. The existing codebase — patterns, style, idioms, dependency conventions
+1. **`docs/PHILOSOPHY.md`** — the lens for every tradeoff you make while writing code. The anti-patterns list is a block-list — violations of any item there should not enter the tree.
+2. `docs/intent/<feature-slug>.md`
+3. Feature documentation
+4. `docs/architecture/<feature-slug>.md` (existing notes)
+5. E2E tests
+6. Integration tests
+7. Unit tests
+8. The existing codebase — patterns, style, idioms, dependency conventions
 
 ## How to run this step
 
@@ -50,6 +51,12 @@ Write the production code. Drive every change from a red test going green. Keep 
 - **If you need something from another workstream**, check whether its interface is already locked in a contract file. If yes, code against it (use the specified fake while its implementation lands). If no, stop — the workstream plan is under-specified; escalate.
 - **No cross-workstream refactors.** A refactor that touches multiple workstreams' files waits until all workstreams in the affected waves are green, then happens as its own dedicated workstream.
 - **Shared files merge with intent.** If the plan names a shared file (e.g. `main.go`) with a single owner and a wave number, only that owner edits it at that wave. Nobody sneaks changes in early.
+
+## Wave review — required at the end of every wave
+
+When a wave's workstreams finish (all workstreams in that wave's implementation are green), **invoke the `wave-review` skill** before moving to the next wave. The review is non-optional; a wave without a PASS'd review has not closed. See `.claude/skills/wave-review/SKILL.md` for the checklist — it covers scope conformance, build state, green/regression correctness, philosophy adherence, strict-mode discipline, and cross-workstream consistency.
+
+If wave-review returns NEEDS-REWORK, fix the items listed in its report (re-dispatch the guilty subagent if scope-level, hand-edit if local), then re-run wave-review. Do not move to the next wave until it PASSes.
 
 ## Code quality rules
 

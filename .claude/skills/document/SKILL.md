@@ -13,10 +13,11 @@ Turn a confirmed intent document into **accurate, extensive, practical documenta
 
 ## Inputs (read in this order)
 
-1. `docs/intent/<feature-slug>.md` (highest; nothing you write may contradict it)
-2. Existing READMEs, CHANGELOGs, `docs/` content (for style and scope of overlap)
-3. The current codebase (for any pre-existing interfaces to be consistent with)
-4. The `plans/` directory if it exists (design provenance, not a spec — treat as supplementary)
+1. **`docs/PHILOSOPHY.md`** — in particular axis 1 (Clarity for the LLM) and axis 3 (Observability for the solo developer), both of which govern how examples, defaults, and failure modes get documented. Read first.
+2. `docs/intent/<feature-slug>.md` (highest; nothing you write may contradict it)
+3. Existing READMEs, CHANGELOGs, `docs/` content (for style and scope of overlap)
+4. The current codebase (for any pre-existing interfaces to be consistent with)
+5. The `plans/` directory if it exists (design provenance, not a spec — treat as supplementary)
 
 ## What you produce
 

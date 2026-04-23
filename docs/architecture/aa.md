@@ -46,7 +46,7 @@ type Backend interface {
 ### Context
 The displayed session state (`PROVISIONING`, `RUNNING`, `DONE`, `FAILED`, `LIMBO`, `INCONSISTENT`, `PUSHED`, `TORN_DOWN`) is derived from three inputs:
 1. Laptop's session record (`~/.aa/sessions/<id>.json`) — operational state like "has this been pushed?" that the agent host doesn't know.
-2. Remote state file (`/workspace/.aa/state`) — what the agent wrote before exiting, if anything.
+2. Remote state file (`$AA_WORKSPACE/.aa/state` on the agent host — absolute path depends on backend) — what the agent wrote before exiting, if anything.
 3. Container's current status + exit code — observed by querying the backend.
 
 Storing a canonical "state" in one place is a foot-gun: the other two sources of truth drift past it.
@@ -103,7 +103,71 @@ Write a ~150-line HTTP CONNECT proxy in `cmd/aa-proxy/` that reads an allowlist 
 
 ---
 
-## Decision 4: `git push` is the only irreversible operation
+## Decision 4: Ship a no-isolation `process` backend for dev/test
+
+**Date:** 2026-04-23
+**Status:** proposed
+
+### Context
+The v1 security story — Docker container with kernel-level egress enforcement — is what makes `aa` trustworthy for real agent work. It's also what makes the dev loop and test suite require Docker, which (a) excludes non-Linux laptops from running most integration tests and (b) slows iteration on `aa`'s own orchestration code, where the container is just overhead.
+
+### Options considered
+1. **Keep Docker the only local backend.** Tests requiring the CLI end-to-end behaviour can only run on Linux with Docker. Devs on macOS or corporate machines with Docker restrictions hit friction daily. Rejected — friction too high.
+2. **Ship a `process` backend with the same Backend interface, no isolation.** Agent runs as a regular child process on the laptop. Accepted with hard guardrails (see Decision below).
+3. **Mock Docker in tests.** Rejected — mocks give false confidence that the production path works; the whole point of e2e tests is to prove the real CLI path.
+
+### Decision
+Add a third v1 backend `process` with these constraints, enforced in code at session start:
+
+- **Opt-in only.** Environment variable `AA_ALLOW_UNSAFE_PROCESS_BACKEND=1` is required. Config alone is not sufficient. `aa` refuses the session with a clear error if the env var is missing.
+- **`egress_enforcement: "none"` is the only valid value.** Any other value is a hard config error. No silent downgrade, no attempt to pretend the allowlist is in effect.
+- **Loud no-isolation banner at every session start**, printed to stderr so CI logs capture it.
+- **No new code in session-manager or verbs to support process-specific behaviour.** The Backend interface is the only seam. If `process` needs a new verb or a special status display, the abstraction is wrong.
+
+### Consequences
+- Dev loop and most e2e/integration tests run on any machine with Go + `git` installed — no Docker, no root, no iptables.
+- The e2e egress-enforcement journey stays Docker+Linux gated; it is the only journey that specifically tests the isolation story, and cannot be meaningfully run under `process`.
+- Adds one workstream (`backend-process`) in wave 2, paralleling `backend-local`.
+- Reinforces that the Backend interface is the single seam for adding backends of varying isolation strength; a future "run in ssh VM" or "run in gVisor" backend plugs in the same way.
+
+---
+
+## Decision 5: Agent-environment contract is env-var-based, not path-based
+
+**Date:** 2026-04-23
+**Status:** proposed
+
+### Context
+Agents need to know where their workspace is, where to write the state file, and where to write the result patch. The two common designs: (a) a fixed absolute path like `/workspace/.aa/state` that every backend must reproduce, or (b) an environment variable the backend sets per-agent-invocation. We must pick one before any agent-contract code lands.
+
+Secondary requirement: the choice should not foreclose supporting multiple agents sharing one backend in the future, which is plausible for sidecar, orchestrator-worker, or warm-VM-sharing designs.
+
+### Options considered
+1. **Fixed path (`/workspace/.aa/state`).** Simple for agents. Breaks the `process` backend because `/workspace` has no meaning on the host filesystem without kludges (sudo-creating `/workspace`, or symlinking it). Also couples every backend's filesystem layout to one convention.
+2. **Per-agent env var (`AA_WORKSPACE`).** Agent reads `$AA_WORKSPACE/.aa/state`. Backend sets the var to whatever absolute path is correct on that backend. Naturally supports N-agents-per-backend — each agent's env carries its own value.
+3. **Per-agent cwd pinning.** Backend `cd`s into the workspace before exec'ing the agent; agent writes `.aa/state` relative to cwd. Breaks the moment the agent itself `cd`s somewhere.
+
+### Decision
+Pick option 2. The injected agent environment in v1 is exactly:
+
+| Variable | Value |
+|---|---|
+| `AA_WORKSPACE` | absolute path to this agent's workspace root on the backend |
+| `AA_SESSION_ID` | opaque string identifying this session |
+
+Within `$AA_WORKSPACE`, `.aa/state`, `.aa/result.patch`, and `.aa/agent.log` are conventions the agent honours. The contract is identical across all backends; each backend is responsible for setting `AA_WORKSPACE` to the right absolute path at exec time (inside container: `/workspace`; inside Fly VM: `/home/fly/workspace`; on `process`: `~/.aa/workspaces/<id>`).
+
+Reserved for future additions, not v1: `AA_STATE_FILE`, `AA_RESULT_PATCH`, `AA_AGENT_NAME`. Adding these later is additive and backwards-compatible with any agent that reads `$AA_WORKSPACE/.aa/state`.
+
+### Consequences
+- Every fixture script, helper, and test that currently references `/workspace/.aa/*` becomes `$AA_WORKSPACE/.aa/*`.
+- The backend interface method that exec's the agent must plumb these env vars through. Easiest: backend constructs the agent's env internally as `{AA_WORKSPACE: ..., AA_SESSION_ID: ...} ∪ agent.env`.
+- Forward compatibility: running two agents on one backend requires no contract change — each agent is exec'd with its own `AA_WORKSPACE`.
+- `aa-done` and `aa-fail` helper scripts read `$AA_WORKSPACE` from their own environment to locate the state file — they don't need arguments or caller-provided paths.
+
+---
+
+## Decision 6: `git push` is the only irreversible operation
 
 **Date:** 2026-04-23
 **Status:** proposed
@@ -157,7 +221,7 @@ Before any workstream starts, these files exist with final type signatures and d
 - `cmd/aa/patch.go` — `Patch`, `ChangedFile` types, `ParsePatch` signature.
 - `cmd/aa/ssh.go` — `SSHRunner` interface, `SSHResult` type.
 - `cmd/aa/sessions.go` — `SessionStore` interface.
-- `cmd/aa/testfakes.go` — shared fakes for the above interfaces (used by every workstream's tests).
+- `cmd/aa/fakes_test.go` — shared fakes for the above interfaces (used by every workstream's tests). Test-only (`_test.go`) so fakes never ship in the production binary.
 
 ### Wave 1 (fully parallel — pure code, no cross-workstream dependencies)
 
@@ -200,7 +264,7 @@ Before any workstream starts, these files exist with final type signatures and d
   - **Owns:** `cmd/aa/keys_anthropic.go`
   - **Consumes:** `EphemeralKeyProvider` interface from `keys.go`
   - **Produces:** `AnthropicKeyProvider` implementing the interface
-  - **Fakes needed:** HTTP test server fake (in `testfakes.go`) for Anthropic Admin API responses
+  - **Fakes needed:** HTTP test server fake (in `fakes_test.go`) for Anthropic Admin API responses
   - **Tests:** `cmd/aa/keys_anthropic_test.go`
 
 - **`session-store`**
@@ -216,15 +280,22 @@ Before any workstream starts, these files exist with final type signatures and d
   - **Owns:** `cmd/aa/ssh_runner.go`
   - **Consumes:** `SSHRunner` interface from `ssh.go`
   - **Produces:** `RealSSHRunner` (shells out to `ssh` with ControlMaster configured)
-  - **Fakes needed:** fake `SSHRunner` already provided in `testfakes.go`
+  - **Fakes needed:** fake `SSHRunner` already provided in `fakes_test.go`
   - **Tests:** `cmd/aa/ssh_runner_test.go` — uses a local `sshd` in container for integration coverage; unit tests use the fake
 
 - **`backend-local`**
   - **Owns:** `cmd/aa/backend_local.go`
   - **Consumes:** `Backend` interface from `backend.go`; shells out to `docker`
   - **Produces:** `LocalBackend` implementing `Backend`
-  - **Fakes needed:** fake `Backend` in `testfakes.go`
+  - **Fakes needed:** fake `Backend` in `fakes_test.go`
   - **Tests:** `cmd/aa/backend_local_test.go` — gated on Docker availability
+
+- **`backend-process`**
+  - **Owns:** `cmd/aa/backend_process.go`
+  - **Consumes:** `Backend` interface from `backend.go`
+  - **Produces:** `ProcessBackend` implementing `Backend`. Host = the laptop itself. Container = a detached child process (double-fork + setsid on Unix) running the agent's `run` command with cwd set to a per-session workspace under `~/.aa/workspaces/<id>/`. Enforces `egress_enforcement == "none"` and the `AA_ALLOW_UNSAFE_PROCESS_BACKEND=1` env gate at session start.
+  - **Fakes needed:** none beyond the shared `Backend` fake
+  - **Tests:** `cmd/aa/backend_process_test.go` — runs everywhere Go runs, no Docker needed. This backend is what lets wave-4 integration tests and most e2e journeys run in CI without a Docker runner.
 
 - **`egress-controller`**
   - **Owns:** `cmd/aa/egress.go`
@@ -239,7 +310,7 @@ Before any workstream starts, these files exist with final type signatures and d
   - **Owns:** `cmd/aa/backend_fly.go`
   - **Consumes:** `Backend` interface; shells out to `flyctl`; uses `ssh-runner` for in-VM operations
   - **Produces:** `FlyBackend` implementing `Backend`
-  - **Fakes needed:** fake `flyctl` helper in `testfakes.go`; reuses fake `SSHRunner`
+  - **Fakes needed:** fake `flyctl` helper in `fakes_test.go`; reuses fake `SSHRunner`
   - **Tests:** `cmd/aa/backend_fly_test.go` — unit-level; full e2e gated on a real Fly account in CI
 
 ### Wave 4 (single writer; integrates everything)
@@ -248,7 +319,7 @@ Before any workstream starts, these files exist with final type signatures and d
   - **Owns:** `cmd/aa/session.go`, `cmd/aa/main.go`, `cmd/aa/verb_*.go` (one file per verb: `verb_attach.go`, `verb_status.go`, `verb_diff.go`, `verb_push.go`, `verb_kill.go`, `verb_retry.go`, `verb_list.go`, `verb_sweep.go`, `verb_init.go`, `verb_version.go`)
   - **Consumes:** every interface defined in the contract files; concrete implementations from waves 1–3
   - **Produces:** the `aa` binary entry point, verb dispatch, session orchestration
-  - **Fakes needed:** fakes for every dependency (from `testfakes.go`) so this wave has independent unit-level tests
+  - **Fakes needed:** fakes for every dependency (from `fakes_test.go`) so this wave has independent unit-level tests
   - **Tests:** `cmd/aa/session_test.go` (unit: orchestration with fakes), `tests/e2e/**` (see below)
 
 ### E2E workstream (separate owner, runs alongside wave 4 or just after)
@@ -264,11 +335,11 @@ Before any workstream starts, these files exist with final type signatures and d
 | File | Single owner | Wave | Edit rule |
 |---|---|---|---|
 | `cmd/aa/main.go` | `session-manager-and-cli` | 4 | Only wave-4 owner edits. Contains `main()`, verb wiring, flag parsing. |
-| `cmd/aa/testfakes.go` | wave-0 authors initially, then any workstream that needs a new fake | 0 → additive | Append-only. Each new fake is a new exported type/constructor; never edit existing fake signatures. |
+| `cmd/aa/fakes_test.go` | wave-0 authors initially, then any workstream that needs a new fake | 0 → additive | Append-only. Each new fake is a new exported type/constructor; never edit existing fake signatures. |
 | `go.mod`, `go.sum` | wave-0 author | 0 | Zero module dependencies goal means these should stay empty beyond `module` line. Any workstream that thinks it needs a dep must escalate — almost certainly wrong given intent. |
 | `docs/architecture/aa.md` | any workstream that makes an architectural decision | any wave | Additive only; new ADRs are appended, existing ADRs' statuses can be edited by their author to flip `proposed` → `accepted`. |
 | `README.md` | drift-fix only, not a workstream target | any | Edits only via the `document` skill when drift is detected. Workstreams don't edit docs to match their code. |
 
 ### Known unavoidable conflict points
 
-None, given the layout above. Every functional file has exactly one workstream owning it. `main.go` is deferred to wave 4 so all collaborators are stable. `testfakes.go` is append-only by convention so concurrent extensions don't collide. If a real conflict appears during implementation, that's the signal to return here and revise.
+None, given the layout above. Every functional file has exactly one workstream owning it. `main.go` is deferred to wave 4 so all collaborators are stable. `fakes_test.go` is append-only by convention so concurrent extensions don't collide. If a real conflict appears during implementation, that's the signal to return here and revise.

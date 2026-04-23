@@ -13,10 +13,11 @@ Between documentation (what the feature *is*) and tests (how we verify it), ther
 
 ## Inputs (read in this order)
 
-1. `docs/intent/<feature-slug>.md`
-2. The documentation written in the previous step
-3. The existing codebase — patterns, abstractions, boundaries already in place
-4. Any `docs/architecture/` or `docs/adr/` contents
+1. **`docs/PHILOSOPHY.md`** — the lens. Every tradeoff you surface is resolved by walking its axes. Read first, every time; it's short.
+2. `docs/intent/<feature-slug>.md`
+3. The documentation written in the previous step
+4. The existing codebase — patterns, abstractions, boundaries already in place
+5. Any `docs/architecture/` or `docs/adr/` contents
 
 ## Principles to apply — explicitly
 

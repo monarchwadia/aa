@@ -15,7 +15,8 @@ Running a coding agent on a real repo forces a bad tradeoff: give it your creden
 - Ships as one static Go binary, stdlib only.
 - Repo config is a two-field `aa.json`. Global config is `~/.aa/config.json`.
 - Agent-agnostic: any shell command works in the agent's `run` field. No agent-specific code paths in aa itself.
-- Two backends in v1: `local` (laptop Docker) and `fly` (ephemeral Firecracker VMs).
+- Agent ↔ aa contract uses env vars, not fixed absolute paths. `aa` injects `AA_WORKSPACE` (absolute path to this agent's workspace root) and `AA_SESSION_ID` into the agent's environment. By convention, the agent writes `.aa/state` and `.aa/result.patch` under `$AA_WORKSPACE`. This contract is identical across all backends (including future "N agents on one backend" scenarios, where each agent's env carries its own workspace value).
+- Three backends in v1: `local` (laptop Docker, container isolation), `fly` (ephemeral Firecracker VMs, VM isolation), and `process` (host child process, NO isolation — dev/test only).
 
 ## Non-goals
 - IDE integration, hosted service, multi-user sessions, auto-push/auto-merge.
@@ -28,6 +29,7 @@ Running a coding agent on a real repo forces a bad tradeoff: give it your creden
 - Shell out to `ssh`, `scp`, `docker`, `git`, `tmux`, `flyctl` — do not reimplement them.
 - Provider-agnostic egress enforcement (iptables + forward proxy on the host). Works on any Linux VM, not tied to a single cloud.
 - macOS local backend uses a privileged helper container to install iptables rules inside Docker Desktop's VM, or fails loud with `egress_enforcement: "none"` as an explicit opt-out. No silent downgrade.
+- The `process` backend is opt-in only, gated by `AA_ALLOW_UNSAFE_PROCESS_BACKEND=1` in the environment. It forces `egress_enforcement: "none"` (cannot enforce egress on a host-level process without interfering with the user's own networking) and prints a loud no-isolation warning at every session start. It exists so the dev loop and test suite can run without Docker; it is NOT intended for running real agents on untrusted code.
 - Config is JSON.
 
 ## Command surface in v1
@@ -42,3 +44,5 @@ Running a coding agent on a real repo forces a bad tradeoff: give it your creden
 ## History
 - 2026-04-23 — initial intent, extracted from `plans/plan-1.md` and `README.md`.
 - 2026-04-23 — closed open questions on command surface: `aa list`, `aa sweep`, `aa init`, `aa version` are v1; `script` backend is v2.
+- 2026-04-23 — added `process` backend to v1 scope. Opt-in, no isolation, dev/test only. Motivated by unblocking integration tests on any laptop (Docker-free) and speeding the dev loop. Does NOT replace `local` or `fly` for real agent work.
+- 2026-04-23 — locked agent-environment contract as `AA_WORKSPACE` + `AA_SESSION_ID` env vars, with state/patch/log as conventions under `$AA_WORKSPACE/.aa/`. Chosen for backend portability and forward-compat with multi-agent-per-backend.

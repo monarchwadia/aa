@@ -40,6 +40,8 @@ description: End-to-end disciplined software development workflow that runs inte
 
 **Parallelization is a first-class output of step 3.** The workstream breakdown produced there is the scheduling input for steps 4, 5, and 6. Any step past 3 that cannot map its work cleanly onto the workstream list is a signal that step 3 was under-specified — escalate and refine it.
 
+**Wave review is required between every wave in steps 5 and 6.** After a wave's workstreams finish, invoke the `wave-review` skill. The orchestrator does not advance to the next wave until `wave-review` returns PASS. This is how drift is caught early, before it compounds across waves.
+
 ## Precedence hierarchy (reminder, enforced throughout)
 
 1. Intent
@@ -50,6 +52,10 @@ description: End-to-end disciplined software development workflow that runs inte
 6. Code
 
 When anything disagrees, the higher layer is right by default. Any deviation requires going *up* to fix the higher layer first.
+
+## Philosophy — always in force, orthogonal to the hierarchy
+
+`docs/PHILOSOPHY.md` is the lens used to resolve every technical ambiguity inside every step. It does not replace the precedence hierarchy — intent still wins goals — but when two options serve the same layer equally well, philosophy's axes break the tie. Philosophy is referenced from each sub-skill's Inputs; re-read it at the start of each step.
 
 ## How to run this orchestrator
 
@@ -89,6 +95,29 @@ The workflow ends when `review-stack` returns **pass**. At that point:
 - Hand control back to the user.
 
 If `review-stack` returns **needs-rework**, the workflow **does not end**. Go back to the earliest-precedence layer that has drift, fix it, and cascade down. Re-run `review-stack` when complete.
+
+## How to ask the user for input (load-bearing)
+
+The user is the business owner, not the implementer. They have just asked you to generate a lot of code they haven't read. **Do not present technical option menus.**
+
+When you need input to make a decision:
+
+1. **First try to decide yourself.** Walk the lenses in order: intent, then PHILOSOPHY.md axes, then consistency with existing conversation. If the answer falls out, just decide — report what you chose and why in one sentence, and invite redirect.
+2. **If the answer is genuinely under-specified, ask a user-facing question.** Frame it in terms the user already understands:
+   - Who is the user of the tool?
+   - What experience do they need?
+   - What promises is the product making?
+   - What tradeoff matters to the business?
+   Extract the one piece of information you actually need, then make the technical decision yourself with it.
+3. **Only show code-level options as a last resort**, and only when the user is in "architect mode" — actively reading code, or having explicitly asked for the options. When you do, flag explicitly: "this one needs you to look at X; here are the options."
+
+Examples:
+- ❌ "Option A: add recover helper. Option B: remove it. Pick one."
+- ✅ "Do you want to see all failing tests at once while we develop, or is one-at-a-time fine? If no preference, I'll pick the lower-ceremony option."
+- ❌ "Should `AdminAPIBaseURL` be a config field or env var?"
+- ✅ "Should `aa` support enterprise Anthropic customers on self-hosted endpoints in v1, or is that a later concern?"
+
+Minimize the user's decision load. Every question you ask is a tax.
 
 ## Rules
 

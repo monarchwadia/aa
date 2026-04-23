@@ -11,6 +11,7 @@ It is not a framework, an IDE plugin, or a hosted service. It is a single static
 ## Table of contents
 
 - [What problem does aa solve?](#what-problem-does-aa-solve)
+- [Concepts](#concepts)
 - [Mental model](#mental-model)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
@@ -51,6 +52,87 @@ You want to hand a long-running task to a coding agent and walk away. When you c
 | The container's **egress is locked down at the host kernel level** to a hostname allowlist (default: just the agent's API endpoint). | A prompt-injected agent cannot exfil to arbitrary hosts — only the hosts you explicitly allow. |
 | Sessions **survive your laptop closing**. Reattach with `aa`. | You start the agent, detach, close your laptop, come back hours later, reattach. |
 | `aa` is a **single static binary, zero Go dependencies**. Config is JSON. | Install with one download. Nothing to manage. |
+
+---
+
+## Concepts
+
+`aa` has two primary concepts you will interact with constantly. Read these once and the rest of the documentation snaps into place.
+
+### Agent
+
+**An *agent* is the software that does the coding work inside the sandbox.** Claude Code, Aider, Cursor CLI, a custom Python script, a deterministic shell script — anything you can launch from a command line.
+
+An agent is defined in your **global** config (`~/.aa/config.json`) as a named entry:
+
+```json
+"agents": {
+  "claude-code": {
+    "run":              "claude --dangerously-skip-permissions",
+    "env":              { "ANTHROPIC_API_KEY": "keyring:anthropic" },
+    "egress_allowlist": ["api.anthropic.com"]
+  }
+}
+```
+
+- `run` — the shell command that launches the agent. `aa` passes it to `bash -lc` inside the sandbox, verbatim.
+- `env` — environment variables the agent needs, resolved on your laptop from keyring references before the agent starts.
+- `egress_allowlist` — the hostnames the agent is permitted to reach (enforced at the host kernel; see [Egress allowlisting](#egress-allowlisting)).
+
+`aa` does not know or care what the agent does internally. Adding a new agent is a new entry in the global config — **zero code changes to `aa`**. That is what "agent-agnostic" means.
+
+Your repo's `aa.json` picks which agent to use by name: `"agent": "claude-code"`.
+
+### Backend
+
+**A *backend* is the infrastructure that provides the sandbox where the agent runs.** Docker on your laptop, a Fly.io microVM, a plain child process on your laptop.
+
+A backend is defined in the same global config:
+
+```json
+"backends": {
+  "local":   { "type": "local",   "egress_enforcement": "strict" },
+  "fly":     { "type": "fly",     "egress_enforcement": "strict" },
+  "process": { "type": "process", "egress_enforcement": "none"   }
+}
+```
+
+- `type` — the backend implementation (see [Backend types shipped in v1](#backend-types-shipped-in-v1)).
+- `egress_enforcement` — `"strict"` or `"none"`; controls whether the host-kernel egress rules are installed.
+
+`aa` knows everything about the backend: it provisions it, installs egress controls, runs the agent inside it, tears it down. The `default_backend` field in global config picks which backend is used.
+
+### Relationship: orthogonal
+
+Any agent runs on any backend:
+
+| | `local` | `fly` | `process` |
+|---|---|---|---|
+| `claude-code` | Claude in Docker, egress→anthropic | Claude in microVM, egress→anthropic | Claude as laptop process, no isolation |
+| `aider` | Aider in Docker, egress→openai | Aider in microVM, egress→openai | Aider as laptop process, no isolation |
+
+The combination — which agent on which backend — is what `aa` provisions at session start.
+
+### The agent ↔ aa environment contract
+
+When `aa` starts an agent, it injects two environment variables into the agent's shell:
+
+| Variable | Value |
+|---|---|
+| `AA_WORKSPACE` | absolute path to **this** agent's workspace root. The repo's working tree is materialized here. |
+| `AA_SESSION_ID` | opaque string identifying this session. Useful in agent logs for correlating with `aa list` output. |
+
+**Conventions** (not env, documented): within `$AA_WORKSPACE`, the agent uses a reserved `.aa/` subdirectory to communicate with `aa`:
+
+| Path | Purpose |
+|---|---|
+| `$AA_WORKSPACE/.aa/state` | State file the agent writes on exit: `DONE`, or `FAILED: <reason>`. |
+| `$AA_WORKSPACE/.aa/result.patch` | The git-format patch the agent produces (`git format-patch origin/<branch>..HEAD --stdout`). |
+| `$AA_WORKSPACE/.aa/agent.log` | Agent's own log output, if it writes one. Tailed by `aa` for display. |
+
+The two env vars and the three file paths are the **entire** contract between `aa` and an agent. Everything else is the agent's business.
+
+This contract is identical across all backends — the paths are meaningful to the agent regardless of whether its `$AA_WORKSPACE` resolves to `/workspace` inside a container, `/home/fly/ws` on a Firecracker VM, or `~/.aa/workspaces/<id>` on your laptop under the `process` backend. It also supports a future world where multiple agents share one backend: each agent gets its own `$AA_WORKSPACE` at spawn time.
 
 ---
 
@@ -228,7 +310,8 @@ This is where your infrastructure, credentials, agents, and rules live.
     },
     "fly": {
       "type": "fly",
-      "region": "iad"
+      "region": "iad",
+      "egress_enforcement": "strict"
     }
   },
 
@@ -334,7 +417,7 @@ Additional reference schemes (env-var, file-on-disk, password-manager CLIs) are 
 `aa` tracks this state in two places:
 
 - **On your laptop:** `~/.aa/sessions/<repo>-<branch>.json` — holds the host address, SSH key, ephemeral API key handle, backend name.
-- **On the agent host:** `/workspace/.aa/state` — a plain text file the agent writes when it finishes.
+- **On the agent host:** `$AA_WORKSPACE/.aa/state` — a plain text file the agent writes when it finishes. `$AA_WORKSPACE` resolves differently per backend (see [Concepts](#concepts)) but the relative location under it is fixed.
 
 Your laptop is always the source of truth for "does this session exist and where is it?" The agent host is the source of truth for "what did the agent finish with?"
 
@@ -346,7 +429,7 @@ When the agent process inside the container exits, `aa` has to figure out what h
 
 ### 1. `DONE` — clean success
 
-The agent ran `aa-done` (a small helper script `aa` ships inside the container) before exiting, which writes `/workspace/.aa/state` with `DONE`.
+The agent ran `aa-done` (a small helper script `aa` ships into the sandbox) before exiting, which writes `$AA_WORKSPACE/.aa/state` with `DONE`.
 
 ```
   ◆ myapp / feature/oauth — DONE
@@ -432,7 +515,7 @@ Rare but real. State file says `DONE` but the process exited nonzero (usually be
   last 20 lines of agent log:
     > Committed feature/oauth
     > aa-done
-    > /workspace/.aa/post-hook.sh: line 4: git: command not found
+    > $AA_WORKSPACE/.aa/post-hook.sh: line 4: git: command not found
 
   next:
     aa attach   reattach to investigate
@@ -449,7 +532,7 @@ Rare but real. State file says `DONE` but the process exited nonzero (usually be
 
 When you run `aa push`, here's what happens, in order, on **your laptop**:
 
-1. SSH to the agent host and `cat /workspace/.aa/result.patch`.
+1. Read the patch bytes from the backend's storage — SSH `cat` for a remote backend, `docker cp` for `local`, direct filesystem read for `process` — from `$AA_WORKSPACE/.aa/result.patch`.
 2. Pipe the patch through `git apply --stat` and `git apply --numstat` to get the file list.
 3. Match file list against configured [rules](#rules-patch-safeguards).
 4. Display rule violations, patch summary, and prompt for confirmation.
@@ -609,10 +692,36 @@ A **backend** tells `aa` where to run the container and how to install egress co
 
 ### Backend types shipped in v1
 
-| Type | Host | Use case |
-|---|---|---|
-| `local` | Your laptop's Docker | Development, offline work, fast iteration |
-| `fly` | Fly.io Machines (Firecracker microVMs) | Ephemeral per-session VMs, 1-3s cold start, good isolation |
+| Type | Host | Isolation | Use case |
+|---|---|---|---|
+| `local` | Your laptop's Docker | Container + egress allowlist | Development with real isolation; offline work; fast iteration |
+| `fly` | Fly.io Machines (Firecracker microVMs) | Hypervisor + egress allowlist | Ephemeral per-session VMs; 1-3s cold start; strongest isolation |
+| `process` | Host child process on your laptop | **None** | Dev loop and test suites only. No Docker needed. **Not safe for real agents.** |
+
+### The `process` backend
+
+`process` runs the agent as an ordinary child process on your laptop — no container, no VM, no egress enforcement. It exists so the dev loop and the integration-test suite can run on any machine where Go runs, including CI runners without Docker.
+
+**Three guardrails keep it from being a foot-gun:**
+
+1. **Opt-in required.** `aa` refuses to use this backend unless `AA_ALLOW_UNSAFE_PROCESS_BACKEND=1` is set in the environment of the `aa` invocation. Missing the flag fails loudly at session start — no silent fallback.
+2. **`egress_enforcement` is forced to `"none"`.** Any other value in config is a configuration error. You cannot accidentally think egress is enforced under `process`.
+3. **Loud no-isolation banner at every session start:**
+   ```
+   ⚠  backend: process — NO ISOLATION
+      Agent has full access to your laptop: filesystem, env vars,
+      SSH keys, network. Dev/test use only. For real agent work,
+      use `local` or `fly`.
+   ```
+
+**What `process` is useful for:**
+- Writing and running the e2e/integration tests for `aa` itself without needing Docker.
+- Iterating on `aa`'s own CLI/verb behaviour where the security boundary isn't the thing being tested.
+- A quick smoke check that a new agent's `run` command is wired correctly before committing a container image.
+
+**What `process` is NOT for:**
+- Running an agent on code you didn't write. It cannot protect you.
+- Anything where the `aa` security story (isolation, egress allowlist) is load-bearing.
 
 ### Deferred to v2
 
@@ -664,6 +773,8 @@ If privileged containers are blocked (many corporate machines do this), strict m
 ```
 
 **Recommendation on security-sensitive work on macOS: use `fly`.** Real VM isolation, strong egress control, bounded cost, fast provisioning.
+
+**For dev/test iteration on macOS where Docker Desktop privileged containers aren't available or desired**, the `process` backend is a no-isolation alternative. It requires `AA_ALLOW_UNSAFE_PROCESS_BACKEND=1` and runs the agent as a regular macOS process with full laptop access. Useful for quickly smoke-testing an agent's `run` command or iterating on `aa` itself; not for running real agents on code you didn't write. See [The `process` backend](#the-process-backend).
 
 ### Persistent vs ephemeral
 
@@ -718,6 +829,28 @@ Queries each configured backend for resources tagged `aa-*`, cross-references ag
 | OpenAI | Project-scoped keys | Partial | Partial |
 | (others) | Defaults to using the static key if ephemeral is not available; surfaced as a warning at session start |
 
+### Overriding the admin API endpoint
+
+Any agent entry can set an `admin_api_base_url` field to override the default Admin API endpoint used for ephemeral-key lifecycle:
+
+```json
+"agents": {
+  "claude-code": {
+    "run": "claude --dangerously-skip-permissions",
+    "env": { "ANTHROPIC_API_KEY": "keyring:anthropic" },
+    "egress_allowlist": ["api.anthropic.com"],
+    "admin_api_base_url": "https://my-enterprise-anthropic.example.com"
+  }
+}
+```
+
+Two legitimate uses:
+
+1. **Self-hosted / enterprise Anthropic deployments** with their own admin API endpoint.
+2. **Tests**, which point this at a local `httptest.Server` to exercise the key lifecycle without touching production.
+
+The field is not a secret — it's a URL. The admin key itself still resolves via `keyring:` or equivalent.
+
 ---
 
 ## Security model
@@ -726,16 +859,20 @@ Queries each configured backend for resources tagged `aa-*`, cross-references ag
 
 ### What aa protects against
 
-| Threat | Mitigation |
-|---|---|
-| Agent exfiltrating your git credentials | Credentials never leave your laptop; agent has no push access. |
-| Agent trashing your laptop filesystem | Container is on a different host. Only the repo's working tree is synced. |
-| Agent persisting between sessions | Ephemeral backend: fresh VM per session, destroyed at teardown. |
-| Agent exfiltrating to arbitrary hosts | Egress allowlist enforced at host kernel. Container cannot bypass. |
-| Agent consuming unbounded resources on your laptop | Not on your laptop. |
-| Agent reading other projects on your laptop | Only the current repo is synced. |
-| Agent forging the diff you review | Patch is read as text over SSH and diff is rendered locally. Agent host is not in the review trust path. |
-| Agent burning unbounded LLM spend | Ephemeral keys have a spend cap and TTL. |
+The `Backends` column names which backends each protection applies to. A missing backend in that column means the protection is **not in force** on that backend.
+
+| Threat | Mitigation | Backends |
+|---|---|---|
+| Agent exfiltrating your git credentials | Credentials never leave your laptop; agent has no push access. | `local`, `fly`, `process` |
+| Agent trashing your laptop filesystem | Container/VM is a separate filesystem. Only the repo's working tree is synced. | `local`, `fly` |
+| Agent persisting between sessions | Ephemeral backend: fresh VM per session, destroyed at teardown. | `fly` |
+| Agent exfiltrating to arbitrary hosts | Egress allowlist enforced at host kernel. Container cannot bypass. | `local`, `fly` |
+| Agent consuming unbounded resources on your laptop | Not on your laptop. | `fly` |
+| Agent reading other projects on your laptop | Only the current repo is synced into the sandbox. | `local`, `fly` |
+| Agent forging the diff you review | `aa` reads raw patch bytes from the backend's storage (SSH `cat` for remote backends, filesystem read for local/process). Diff rendering and rule evaluation happen on the laptop — the agent never formats what you see. | `local`, `fly`, `process` |
+| Agent burning unbounded LLM spend | Ephemeral keys have a spend cap and TTL. | `local`, `fly`, `process` |
+
+**If you are using `process`:** the only protections in force are the credential-isolation promise (the agent still doesn't get git push credentials; `aa push` still runs on your laptop with your creds after review), the review trust path (rendering happens on the laptop), and ephemeral-key controls. Everything else — filesystem isolation, egress allowlist, resource bounds, cross-project privacy — is OFF. This is deliberate: `process` is a dev/test backend, not a security posture.
 
 ### What aa does NOT protect against
 
@@ -814,7 +951,7 @@ You can't. Allowlist is set at container start and enforced at the kernel. Kill 
 - Host a server. There is no `aa` daemon, no cloud service, no account.
 - Provide collaborative multi-user sessions. One user per session.
 - Auto-merge, auto-push, auto-rebase. Every state transition past `DONE` requires an explicit verb.
-- Parse the agent's output for intent. The only contract with the agent is: write `/workspace/.aa/state` and `/workspace/.aa/result.patch`. Everything else is the agent's business.
+- Parse the agent's output for intent. The entire contract with the agent is two injected env vars (`AA_WORKSPACE`, `AA_SESSION_ID`) and three files by convention under `$AA_WORKSPACE/.aa/`: `state`, `result.patch`, `agent.log`. Everything else is the agent's business.
 - Mirror your code to any third-party service. The patch goes agent-host → laptop → origin. Nothing else.
 - Manage Anthropic/OpenAI/etc billing. It consumes those APIs on your credentials.
 - Replace code review. If anything, it should make you review more carefully, because an autonomous agent ran unsupervised.

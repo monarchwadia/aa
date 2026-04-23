@@ -22,11 +22,12 @@ Both live under `tests/` in the repo's conventional locations (`tests/integratio
 
 ## Inputs (read in this order)
 
-1. `docs/intent/<feature-slug>.md`
-2. Feature documentation
-3. `docs/architecture/<feature-slug>.md` (if it exists)
-4. The e2e tests written in the previous step (authoritative on external behavior)
-5. The repo's existing test conventions, helpers, and fakes
+1. **`docs/PHILOSOPHY.md`** — the axes that decide what "atomic", "independent", and "fails loud" mean in tests. The anti-patterns list is especially load-bearing here.
+2. `docs/intent/<feature-slug>.md`
+3. Feature documentation
+4. `docs/architecture/<feature-slug>.md` (if it exists)
+5. The e2e tests written in the previous step (authoritative on external behavior)
+6. The repo's existing test conventions, helpers, and fakes
 
 ## What you produce
 
@@ -51,6 +52,12 @@ Test files at `tests/integration/<area>/<file>.<ext>` and `tests/unit/<area>/<fi
 ## Parallelization
 
 Because each workstream owns its own test files and depends only on the locked contract files, workstream test suites can be written concurrently. If multiple agents are available, dispatch one per workstream (each edits only that workstream's `Tests` paths). If working sequentially, order within a wave doesn't matter.
+
+## Wave review — required at the end of every wave
+
+When a wave's workstream subagents (or sequential runs) finish, **invoke the `wave-review` skill** before moving to the next wave. The review is non-optional; a wave without a PASS'd review has not closed. See `.claude/skills/wave-review/SKILL.md` for the checklist.
+
+If wave-review returns NEEDS-REWORK, fix the items listed in its report (re-dispatch the guilty subagent if scope-level, hand-edit if local), then re-run wave-review. Do not move on to the next wave until it PASSes.
 
 ## Rules
 
