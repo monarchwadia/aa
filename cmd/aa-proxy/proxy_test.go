@@ -123,18 +123,22 @@ func TestConnectAllowlistedHost(t *testing.T) {
 }
 
 // TestConnectNonAllowlistedHost verifies the proxy returns 403 and closes.
+//
+// Uses distinct hostnames so the allowlist check actually matters:
+// httptest.NewServer always binds to 127.0.0.1, so putting the raw server
+// host in the allowlist would also admit any OTHER httptest server.
+// Instead we allowlist "allowed.example" (routed to the running server via
+// TestResolve) and CONNECT to "blocked.example" which has no TestResolve
+// entry and is not in the allowlist — exactly the exfil-attempt shape.
 func TestConnectNonAllowlistedHost(t *testing.T) {
-	allowed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer allowed.Close()
 	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("blocked target received a request; proxy should have rejected the CONNECT")
 	}))
 	defer blocked.Close()
 
-	allowedHost, _, _ := hostPort(t, allowed)
-	_, _, blockedHP := hostPort(t, blocked)
+	_, blockedPort, _ := hostPort(t, blocked)
 
-	p := NewProxy([]string{allowedHost})
+	p := NewProxy([]string{"allowed.example"})
 	proxyAddr, stop := startProxy(t, p)
 	defer stop()
 
@@ -144,7 +148,7 @@ func TestConnectNonAllowlistedHost(t *testing.T) {
 	}
 	defer conn.Close()
 
-	status, _ := sendConnect(t, conn, blockedHP)
+	status, _ := sendConnect(t, conn, "blocked.example:"+blockedPort)
 	if !strings.HasPrefix(status, "HTTP/1.1 403") {
 		t.Fatalf("expected 403 status, got %q", status)
 	}

@@ -1,7 +1,5 @@
 package main
 
-import "io"
-
 // Patch is the parsed representation of a git-format patch file produced by
 // `git format-patch origin/<branch>..HEAD --stdout`.
 type Patch struct {
@@ -31,9 +29,5 @@ type ChangedFile struct {
 	OldPath string
 }
 
-// ParsePatch reads a git-format-patch stream and returns a Patch.
-// Pure function over an io.Reader. Implemented in patch_parser.go (wave 1
-// workstream `patch-parser`).
-func ParsePatch(r io.Reader) (Patch, error) {
-	panic("unimplemented — see workstream `patch-parser` in docs/architecture/aa.md § Workstreams")
-}
+// ParsePatch is implemented in patch_parser.go (wave 1 workstream
+// `patch-parser`). See that file for the doc comment and example.

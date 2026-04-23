@@ -1,6 +1,17 @@
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+)
+
+// provisionTimeout is the window after CreatedAt during which a
+// still-zero-value Host is considered PROVISIONING rather than
+// FAILED_PROVISION. Past this window, if the backend has still not produced
+// a reachable Host, we assume provisioning failed. Ten minutes is long
+// enough to cover slow cold-starts on remote backends and short enough that
+// a truly-stuck session surfaces without the user having to look.
+const provisionTimeout = 10 * time.Minute
 
 // SessionState is the user-visible state of an aa session, computed on
 // demand from three inputs (laptop record + remote state file + container
@@ -98,10 +109,54 @@ type RemoteStatus struct {
 
 // ComputeSessionState returns the displayed session state given fresh reads
 // of both the laptop record and the remote status. Pure function; no I/O.
-// Implemented in state_compute.go (wave 1 workstream).
+//
+// Precedence, high to low:
+//  1. TornDownAt set  → TORN_DOWN (wins over PushedAt; teardown is past push).
+//  2. PushedAt set    → PUSHED    (wins over any remote view; the laptop's
+//     operational record is the source of truth).
+//  3. Zero-value Host → PROVISIONING if the record is younger than
+//     provisionTimeout, else FAILED_PROVISION.
+//  4. Container alive → RUNNING.
+//  5. Container dead  → merge the state file and exit code:
+//     "DONE"+exit 0               → DONE
+//     "DONE"+exit!=0              → INCONSISTENT
+//     "FAILED…"+exit!=0           → FAILED
+//     "FAILED…"+exit 0            → INCONSISTENT
+//     ""  (any exit, incl. 0)     → LIMBO (the agent never reported)
 //
 // See docs/architecture/aa.md § "Decision 2" for why this is a function, not
 // a stored enum.
 func ComputeSessionState(rec LocalSessionRecord, remote RemoteStatus) SessionState {
-	panic("unimplemented — see workstream `state-compute` in docs/architecture/aa.md § Workstreams")
+	if rec.TornDownAt != nil {
+		return StateTornDown
+	}
+	if rec.PushedAt != nil {
+		return StatePushed
+	}
+
+	if rec.Host.Address == "" && rec.Host.BackendType == "" {
+		if time.Since(rec.CreatedAt) > provisionTimeout {
+			return StateFailedProvision
+		}
+		return StateProvisioning
+	}
+
+	if remote.ContainerAlive {
+		return StateRunning
+	}
+
+	stateFileSaidDone := remote.StateFile == "DONE"
+	stateFileSaidFailed := strings.HasPrefix(remote.StateFile, "FAILED")
+	exitClean := remote.ExitCode == 0
+
+	switch {
+	case stateFileSaidDone && exitClean:
+		return StateDone
+	case stateFileSaidFailed && !exitClean:
+		return StateFailed
+	case stateFileSaidDone || stateFileSaidFailed:
+		return StateInconsistent
+	default:
+		return StateLimbo
+	}
 }
