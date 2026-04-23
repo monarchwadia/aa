@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -135,19 +136,25 @@ func TestTerminalSessionStatesAreDisplayedCorrectly(t *testing.T) {
 	}
 }
 
-// seedSessionState is the test affordance for preloading a synthetic session.
-// Expected hook: `aa init --test-fixture=<state-file>:<exit-code>:<message>`
-// or an equivalent admin path. If the implementation provides something
-// different, update here but preserve the journey's assertions.
+// seedSessionState creates a synthetic session by invoking `aa fixture`
+// with the requested state-file contents and exit code. The fixture
+// subcommand is hidden from `aa help`; it exists only to let this test
+// file stand up post-agent state without spawning a real agent.
 func seedSessionState(t *testing.T, home, repo, stateFile string, exitCode int, message string) {
 	t.Helper()
-	_ = home
-	_ = repo
-	_ = stateFile
-	_ = exitCode
-	_ = message
-	// Intentionally a stub — this test file documents what the seed
-	// contract must look like. `implement` will land the real hook; until
-	// then, the sub-tests all fail with "aa status: no session" which is
-	// the correct red signal.
+	args := []string{"fixture", "--exit", fmt.Sprintf("%d", exitCode)}
+	if stateFile != "" {
+		args = append(args, "--state", stateFile)
+	}
+	if message != "" {
+		args = append(args, "--message", message)
+	}
+	out := runAa(t, aaInvocation{
+		Args:    args,
+		HomeDir: home,
+		WorkDir: repo,
+	})
+	if out.ExitCode != 0 {
+		t.Fatalf("aa fixture: exit=%d stdout=%q stderr=%q", out.ExitCode, out.Stdout, out.Stderr)
+	}
 }

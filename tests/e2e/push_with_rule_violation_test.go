@@ -196,19 +196,24 @@ func newGitRepoWithOrigin(t *testing.T, origin, aaJSON string) string {
 }
 
 // preloadPatch simulates an agent that has already finished and written a
-// result.patch to its workspace. The implementation must expose a
-// test-mode hook to accept a pre-made patch file without actually running an
-// agent; if that's missing, this helper is the pressure point forcing it.
+// result.patch to its workspace. It writes the patch bytes to a temp file,
+// then invokes `aa fixture --state DONE --exit 0 --patch-file <tmp>` so
+// aa itself creates the session record and workspace — the same code path
+// a real agent run would eventually produce.
 func preloadPatch(t *testing.T, home, repo, patch string) {
 	t.Helper()
-	stateDir := filepath.Join(home, ".aa", "testfixtures")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		t.Fatalf("mkdir %s: %v", stateDir, err)
+	tmp := filepath.Join(t.TempDir(), "preload.patch")
+	if err := os.WriteFile(tmp, []byte(patch), 0o644); err != nil {
+		t.Fatalf("write preload patch: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "preload.patch"), []byte(patch), 0o644); err != nil {
-		t.Fatalf("write preload.patch: %v", err)
+	out := runAa(t, aaInvocation{
+		Args:    []string{"fixture", "--state", "DONE", "--exit", "0", "--patch-file", tmp},
+		HomeDir: home,
+		WorkDir: repo,
+	})
+	if out.ExitCode != 0 {
+		t.Fatalf("aa fixture preload: exit=%d stdout=%q stderr=%q", out.ExitCode, out.Stdout, out.Stderr)
 	}
-	_ = repo
 }
 
 // originHasPatch returns true if the bare origin repo has received at least
