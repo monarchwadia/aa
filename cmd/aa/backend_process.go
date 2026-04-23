@@ -33,6 +33,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -168,6 +170,26 @@ func (b *ProcessBackend) RunContainer(ctx context.Context, host Host, spec Conta
 	env = append(env, "AA_SESSION_ID="+string(spec.SessionID))
 	cmd.Env = env
 
+	// Detach stdio from the parent aa process. If we inherited aa's
+	// stdout/stderr, the detached agent would keep those fds open after
+	// aa exits — and when aa itself was spawned via exec.Cmd (as in the
+	// e2e tests), its io.Copy pumps never see EOF and Wait() hangs
+	// forever. Redirect to an agent.log file inside .aa/ so logs are
+	// still observable.
+	logDir := filepath.Join(host.Workspace, ".aa")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return ContainerHandle{}, fmt.Errorf("process backend: create log dir: %w", err)
+	}
+	logFile, err := os.OpenFile(filepath.Join(logDir, "agent.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return ContainerHandle{}, fmt.Errorf("process backend: open agent log: %w", err)
+	}
+	// Close our handle after Start — the child inherits its own dup.
+	defer logFile.Close()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+
 	// Detach: new session + new process group so the agent outlives the
 	// aa process and does not receive its SIGHUP. INTENT success criterion
 	// "detach, close the laptop, reopen hours later, and reattach" depends
@@ -195,6 +217,16 @@ func (b *ProcessBackend) RunContainer(ctx context.Context, host Host, spec Conta
 	}
 	b.pidsByWorkspace[host.Workspace] = pid
 	b.pidsMu.Unlock()
+
+	// Persist the PID to disk so a subsequent `aa kill` invocation (which
+	// runs in a fresh process and starts with an empty in-memory map) can
+	// still find the agent process group to terminate. Without this, the
+	// detached agent (Setsid) outlives every aa invocation forever.
+	if pid != 0 {
+		pidFile := filepath.Join(host.Workspace, ".aa", "pid")
+		_ = os.MkdirAll(filepath.Dir(pidFile), 0o755)
+		_ = os.WriteFile(pidFile, fmt.Appendf(nil, "%d\n", pid), 0o644)
+	}
 
 	return ContainerHandle{
 		ID:   fmt.Sprintf("%d", pid),
@@ -277,6 +309,19 @@ func (b *ProcessBackend) Teardown(ctx context.Context, host Host) error {
 		delete(b.pidsByWorkspace, host.Workspace)
 	}
 	b.pidsMu.Unlock()
+
+	// If the in-memory map is empty (typical for `aa kill` running in a
+	// fresh process after the start invocation has long since exited),
+	// fall back to the PID file written at RunContainer time.
+	if !hadPid {
+		pidFile := filepath.Join(host.Workspace, ".aa", "pid")
+		if data, err := os.ReadFile(pidFile); err == nil {
+			if parsed, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && parsed > 0 {
+				pid = parsed
+				hadPid = true
+			}
+		}
+	}
 
 	if hadPid && pid > 0 {
 		// Signal the whole process group. Low ceremony: SIGKILL is the
