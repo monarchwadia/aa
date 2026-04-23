@@ -1,5 +1,6 @@
 # Built binaries — cross-compiled by aa's build, never committed.
 /aa
+/aa-proxy
 /cmd/aa/aa
 /cmd/aa-proxy/aa-proxy
 
