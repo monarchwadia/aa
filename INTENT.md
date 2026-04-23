@@ -30,10 +30,15 @@ Running a coding agent on a real repo forces a bad tradeoff: give it your creden
 - macOS local backend uses a privileged helper container to install iptables rules inside Docker Desktop's VM, or fails loud with `egress_enforcement: "none"` as an explicit opt-out. No silent downgrade.
 - Config is JSON.
 
+## Command surface in v1
+- Core verbs: `aa`, `aa status`, `aa attach`, `aa diff`, `aa push`, `aa kill`, `aa retry`.
+- Housekeeping verbs: `aa list` (sessions across repos), `aa sweep` (orphaned resources), `aa init` / `aa init --global`, `aa version`.
+
 ## Open questions
 - Exact JSON shape for the ephemeral-LLM-key config block (TTL and spend-cap concepts decided; field names TBD).
 - Exact JSON shape for backend provisioning fields (Fly API-token reference, VM size, VM TTL — TBD).
-- Whether `aa list`, `aa sweep`, and the `script` backend are v1 or deferred to v2.
+- `script` backend (user-provided shell implementing the backend interface) is deferred to v2.
 
 ## History
 - 2026-04-23 — initial intent, extracted from `plans/plan-1.md` and `README.md`.
+- 2026-04-23 — closed open questions on command surface: `aa list`, `aa sweep`, `aa init`, `aa version` are v1; `script` backend is v2.

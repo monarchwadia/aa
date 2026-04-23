@@ -786,13 +786,7 @@ Restarts the agent in place (only valid in `LIMBO` / `FAILED`).
 
 ### "SSH connection refused" when reattaching
 
-The VM may have been reaped by the provider (TTL expired, billing issue) or the backend's network had a blip.
-
-```bash
-aa status --verbose
-```
-
-Shows the last heartbeat and the VM's provider-side status. If the VM is gone, the session is unrecoverable; `aa kill` to clean local state.
+The VM may have been reaped by the provider (TTL expired, billing issue) or the backend's network had a blip. Run `aa status` to see the last known host state. If the VM is gone, the session is unrecoverable; `aa kill` to clean local state.
 
 ### "Egress enforcement failed" at session start
 
@@ -809,14 +803,6 @@ You can't. Allowlist is set at container start and enforced at the kernel. Kill 
 1. Pull patch → **succeeds or aborts** (no remote changes).
 2. Apply patch to local clone → **succeeds or aborts** (no remote changes).
 3. `git push` → if this fails, the local clone has the commits but origin doesn't. **Remote VM is still up.** Your session state stays `DONE`. You can inspect the local clone under `~/.aa/sessions/<id>/clone/` and push manually, then run `aa kill` to tear the remote down without re-pushing.
-
-### I want to see the raw agent log
-
-```bash
-aa attach --log
-```
-
-Tails `/workspace/.aa/agent.log` on the agent host. Does not attach to the agent's TTY. Good for scripts and for debugging.
 
 ---
 
