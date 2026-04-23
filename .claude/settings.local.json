@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/vscode/.claude/**)",
+      "Bash(go test *)",
+      "Bash(go vet *)",
+      "Bash(go build *)"
+    ]
+  }
+}
