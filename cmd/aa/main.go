@@ -102,6 +102,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return verbList(ctx, sm, verbArgs, stdout, stderr)
 	case "sweep":
 		return verbSweep(ctx, sm, verbArgs, stdout, stderr)
+	case "fixture":
+		return verbFixture(ctx, sm, cfg, verbArgs, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "aa: unknown verb %q; run `aa version` or see README § Command reference\n", verb)
 		return 2
@@ -168,6 +170,7 @@ func buildSessionManager(stdin io.Reader, stdout, stderr io.Writer, verbose bool
 		sm.Out = io.Discard
 	}
 	sm.Err = stderr
+	sm.LaptopCacheRoot = filepath.Join(homeDir, ".aa", "sessions")
 
 	return sm, resolved, nil
 }

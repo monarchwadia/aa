@@ -145,7 +145,7 @@ func ComputeSessionState(rec LocalSessionRecord, remote RemoteStatus) SessionSta
 		return StateRunning
 	}
 
-	stateFileSaidDone := remote.StateFile == "DONE"
+	stateFileSaidDone := remote.StateFile == "DONE" || strings.HasPrefix(remote.StateFile, "DONE:") || strings.HasPrefix(remote.StateFile, "DONE ")
 	stateFileSaidFailed := strings.HasPrefix(remote.StateFile, "FAILED")
 	exitClean := remote.ExitCode == 0
 

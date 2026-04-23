@@ -28,6 +28,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -72,6 +74,14 @@ type SessionManager struct {
 
 	// Err receives structured error context. Same capture pattern.
 	Err io.Writer
+
+	// LaptopCacheRoot is the directory on the laptop where SessionManager
+	// caches per-session artefacts — currently just the reviewed patch
+	// bytes written to <LaptopCacheRoot>/<id>/result.patch by Diff and
+	// consulted by Push when the agent host is unreachable. Empty
+	// disables the cache (legacy behaviour; tests that don't need it
+	// leave it unset).
+	LaptopCacheRoot string
 }
 
 // NewSessionManager wires a SessionManager from its five primary
@@ -455,15 +465,28 @@ func (s *SessionManager) Status(ctx context.Context, id SessionID) (SessionState
 		remote.AgentMessage = parseAgentMessage(remote.StateFile)
 	}
 
-	// ContainerAlive heuristic for the session manager: if the state file
-	// is empty/absent AND there's no explicit FAILED/DONE content, we
-	// treat the container as alive. When it's DONE/FAILED, container is
-	// not alive and exit code reflects the reported result.
+	// .aa/exit is authoritative when present: the agent-run wrapper writes
+	// it immediately after the agent process exits, carrying the exit code
+	// and implicitly signalling the container is dead. Without this file,
+	// we fall back to inferring liveness from the state file content.
+	exitBytes, exitErr := s.Backend.ReadRemoteFile(ctx, rec.Host, ".aa/exit")
+	if exitErr == nil {
+		if parsed, perr := strconv.Atoi(strings.TrimSpace(string(exitBytes))); perr == nil {
+			remote.ExitCode = parsed
+			remote.ContainerAlive = false
+			return ComputeSessionState(rec, remote), remote, nil
+		}
+	}
+
+	// Legacy inference: state-file content dictates liveness + exit code.
+	// Preserved for backends that don't yet write .aa/exit (and for
+	// tests that only seed the state file). Drift here versus .aa/exit
+	// is the reason the exit-file path is preferred when available.
 	switch {
-	case remote.StateFile == "DONE":
+	case remote.StateFile == "DONE" || strings.HasPrefix(remote.StateFile, "DONE:") || strings.HasPrefix(remote.StateFile, "DONE "):
 		remote.ContainerAlive = false
 		remote.ExitCode = 0
-	case len(remote.StateFile) >= 6 && remote.StateFile[:6] == "FAILED":
+	case strings.HasPrefix(remote.StateFile, "FAILED"):
 		remote.ContainerAlive = false
 		remote.ExitCode = 1
 	default:
@@ -489,6 +512,12 @@ func parseAgentMessage(stateFile string) string {
 // Diff pulls $AA_WORKSPACE/.aa/result.patch from the backend and returns
 // the raw bytes. Rendering, pagers, and re-review are the caller's job.
 //
+// On every successful fetch, Diff also persists the bytes to the laptop
+// under <LaptopCacheRoot>/<id>/result.patch so that later `aa push`
+// invocations can trust the laptop-side copy (INTENT.md § Security model:
+// "the laptop holds the reviewed bytes; the agent host cannot forge what
+// has already been reviewed").
+//
 // Example:
 //
 //	raw, err := sm.Diff(ctx, "myapp-feature-oauth")
@@ -504,7 +533,55 @@ func (s *SessionManager) Diff(ctx context.Context, id SessionID) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("diff session %s: read result.patch: %w", id, err)
 	}
+	// Cache on the laptop. Failure to cache does not fail the verb — the
+	// user still sees the diff — but we surface a warning so the loss of
+	// the security invariant is observable.
+	if cacheErr := s.writeLaptopPatchCache(id, data); cacheErr != nil {
+		s.writeErr("diff: failed to cache patch on laptop: %v", cacheErr)
+	}
 	return data, nil
+}
+
+// laptopPatchCachePath returns the canonical per-session patch cache
+// path under LaptopCacheRoot. Empty LaptopCacheRoot disables caching.
+func (s *SessionManager) laptopPatchCachePath(id SessionID) string {
+	if s.LaptopCacheRoot == "" {
+		return ""
+	}
+	return filepath.Join(s.LaptopCacheRoot, string(id), "result.patch")
+}
+
+// writeLaptopPatchCache persists patch bytes to the laptop-side cache.
+// No-op (nil error) when LaptopCacheRoot is empty.
+func (s *SessionManager) writeLaptopPatchCache(id SessionID, data []byte) error {
+	path := s.laptopPatchCachePath(id)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write cache: %w", err)
+	}
+	return nil
+}
+
+// readLaptopPatchCache returns cached patch bytes if present. Returns
+// (nil, false, nil) when no cache entry exists.
+func (s *SessionManager) readLaptopPatchCache(id SessionID) ([]byte, bool, error) {
+	path := s.laptopPatchCachePath(id)
+	if path == "" {
+		return nil, false, nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
 }
 
 // Push is the only irreversible verb. Steps, in order:
@@ -532,7 +609,21 @@ func (s *SessionManager) Push(ctx context.Context, id SessionID) error {
 
 	patchBytes, err := s.Diff(ctx, id)
 	if err != nil {
-		return fmt.Errorf("push session %s: fetch patch: %w", id, err)
+		// Agent host unreachable (teardown happened already, or network
+		// failed). Fall back to the laptop-cached bytes if the user ran
+		// `aa diff` previously — those bytes were reviewed; they are
+		// authoritative. The user sees BOTH the original error AND the
+		// fallback path so the degraded mode is observable.
+		cached, hadCache, cacheErr := s.readLaptopPatchCache(id)
+		if cacheErr != nil {
+			return fmt.Errorf("push session %s: host unreachable AND cache read failed: %w", id, cacheErr)
+		}
+		if !hadCache {
+			return fmt.Errorf("push session %s: host unreachable and no laptop-cached patch under %s — run `aa diff` before severing the host: %w",
+				id, s.laptopPatchCachePath(id), err)
+		}
+		s.writeOut("push: host unreachable; using laptop-cached patch from %s", s.laptopPatchCachePath(id))
+		patchBytes = cached
 	}
 	s.writeOut("push: fetched patch (%d bytes) for session %s", len(patchBytes), id)
 
@@ -571,7 +662,55 @@ func (s *SessionManager) Push(ctx context.Context, id SessionID) error {
 	// executes git locally. For unit tests, the fake records the argv and
 	// returns programmed responses.
 	gitCmd := fmt.Sprintf("cd %s && git push origin %s", rec.Repo, rec.Branch)
-	res, err := s.SSH.Run(ctx, rec.Host, gitCmd)
+	var res SSHResult
+	if rec.Host.Address == "" {
+		// No remote host — either the backend was laptop-local from the
+		// start (process backend), or `aa kill --host-only` severed the
+		// compute after the patch was cached. Apply the reviewed patch
+		// to the laptop repo and push from there. We deliberately run
+		// `git am` against the cached patch (not over SSH) so the bytes
+		// that land in the commit are exactly the bytes the user saw.
+		cachePath := s.laptopPatchCachePath(id)
+		if _, statErr := os.Stat(cachePath); statErr != nil {
+			// No cache means `aa diff` was never run or the user invoked
+			// push against a session with no patch on the laptop. We
+			// can't apply what we don't have.
+			s.writeErr("push: agent host is unreachable and no reviewed patch is cached at %s — run `aa diff` first, then retry push", cachePath)
+			return fmt.Errorf("push session %s: agent host unreachable and no laptop-cached patch at %s", id, cachePath)
+		}
+		amCmd := fmt.Sprintf("cd %s && git am %s", rec.Repo, cachePath)
+		amExec := exec.CommandContext(ctx, "/bin/sh", "-c", amCmd)
+		// `git am` needs a committer identity. aa itself doesn't author
+		// the commit — it's replaying what the agent already authored —
+		// so set a stable aa-branded committer rather than depending on
+		// the laptop's global git config (which may be unset on fresh
+		// devcontainers). The author trailer inside the patch is
+		// preserved.
+		amExec.Env = append(os.Environ(),
+			"GIT_COMMITTER_NAME=aa",
+			"GIT_COMMITTER_EMAIL=aa@localhost",
+			"GIT_AUTHOR_NAME=aa",
+			"GIT_AUTHOR_EMAIL=aa@localhost",
+		)
+		amOut, amErr := amExec.CombinedOutput()
+		if amErr != nil {
+			// Leave the patch on disk and abort the rest — `git am` has
+			// already rolled back, but the cached patch remains for manual
+			// recovery (`git am` by hand, per README § push failed).
+			s.writeErr("push: applying reviewed patch failed: %v\n%s", amErr, bytes.TrimSpace(amOut))
+			s.writeErr("push: reviewed patch preserved at %s", cachePath)
+			return fmt.Errorf("push session %s: git am: %w", id, amErr)
+		}
+		pushOut, pushErr := exec.CommandContext(ctx, "/bin/sh", "-c", gitCmd).CombinedOutput()
+		if pushErr != nil {
+			s.writeErr("push: git push failed: %v\n%s", pushErr, bytes.TrimSpace(pushOut))
+			s.writeErr("push: patch applied locally at %s; you can `git push` manually", rec.Repo)
+			return fmt.Errorf("push session %s: git push: %w", id, pushErr)
+		}
+		res = SSHResult{ExitCode: 0}
+	} else {
+		res, err = s.SSH.Run(ctx, rec.Host, gitCmd)
+	}
 	if err != nil || res.ExitCode != 0 {
 		s.writeErr("push: git push failed: %v (exit=%d)", err, res.ExitCode)
 		return fmt.Errorf("push session %s: git push: %w", id, err)
@@ -617,6 +756,19 @@ func yesNoLabel(defaultYes bool) string {
 //
 //	err := sm.Kill(ctx, "myapp-feature-oauth")
 func (s *SessionManager) Kill(ctx context.Context, id SessionID) error {
+	return s.killInternal(ctx, id, false)
+}
+
+// KillHostOnly is the sibling of Kill that tears down ONLY the backend
+// host and revokes the ephemeral key. The local session record is
+// preserved. Used by `aa kill --host-only` to support the "trust only
+// the laptop" push path: after severing the host, a cached patch on
+// the laptop remains pushable.
+func (s *SessionManager) KillHostOnly(ctx context.Context, id SessionID) error {
+	return s.killInternal(ctx, id, true)
+}
+
+func (s *SessionManager) killInternal(ctx context.Context, id SessionID, hostOnly bool) error {
 	rec, ok, err := s.Store.Load(id)
 	if err != nil {
 		return fmt.Errorf("kill session %s: load record: %w", id, err)
@@ -637,6 +789,23 @@ func (s *SessionManager) Kill(ctx context.Context, id SessionID) error {
 		s.writeErr("kill: revoke ephemeral key failed: %v", rErr)
 	} else {
 		s.writeOut("kill: revoked ephemeral key for session %s", id)
+	}
+
+	if hostOnly {
+		// Mark the host as gone in the record so Status/Diff/Push know
+		// the backend is absent without deleting the record.
+		rec.Host = Host{}
+		now := s.clockNow()
+		rec.TornDownAt = &now
+		if sErr := s.Store.Save(rec); sErr != nil {
+			s.writeErr("kill: save record after host-only kill failed: %v", sErr)
+			return fmt.Errorf("kill session %s (host-only): save record: %w", id, sErr)
+		}
+		s.writeOut("kill: host-only — local session record preserved")
+		if danglingErr != nil {
+			return fmt.Errorf("kill session %s (host-only): backend host %s may be dangling: %w", id, rec.Host.Address, danglingErr)
+		}
+		return nil
 	}
 
 	if dErr := s.Store.Delete(id); dErr != nil {
